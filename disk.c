@@ -71,7 +71,8 @@ static void ata_delay_400ns(void)
     (void)inb(ATA_ALT_STATUS);
 }
 
-/* Wait for BSY to clear, optionally requiring DRQ. */
+/* Wait for BSY to clear. Data phases require DRQ; completion phases require
+   the drive to be ready with DRQ clear before another command is issued. */
 static int ata_wait(int require_data)
 {
     for (unsigned int i = 0; i < ATA_POLL_LIMIT; ++i) {
@@ -87,6 +88,11 @@ static int ata_wait(int require_data)
             return DISK_ERR_DEVICE;
         }
         if (require_data && (status & ATA_STATUS_DRQ) == 0U) {
+            continue;
+        }
+        if (!require_data &&
+            ((status & ATA_STATUS_DRDY) == 0U ||
+             (status & ATA_STATUS_DRQ) != 0U)) {
             continue;
         }
         return 0;
@@ -204,6 +210,10 @@ int disk_read_sectors(unsigned int lba, unsigned int count,
     }
 
     for (unsigned int sector = 0; sector < count; ++sector) {
+        result = ata_wait(0);
+        if (result != 0) {
+            return result;
+        }
         ata_program_lba(lba + sector);
         outb(ATA_COMMAND, ATA_CMD_READ);
         result = ata_wait(1);
@@ -230,6 +240,10 @@ int disk_write_sectors(unsigned int lba, unsigned int count,
     }
 
     for (unsigned int sector = 0; sector < count; ++sector) {
+        result = ata_wait(0);
+        if (result != 0) {
+            return result;
+        }
         ata_program_lba(lba + sector);
         outb(ATA_COMMAND, ATA_CMD_WRITE);
         result = ata_wait(1);
@@ -265,4 +279,3 @@ const char *disk_error_string(int code)
         default: return "unknown disk error";
     }
 }
-

@@ -14,10 +14,12 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - CPU exception handlers with a readable panic screen
 - 32-bit paging: identity-maps the first 32 MiB with 4 KiB pages; the page allocator only returns pages within that mapped region
 - Shell command `paging` reports whether paging is enabled
-- Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 4096 characters across multiple sectors
+- Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
+- FAT-style free-space map and linked disk clusters, allowing files to share disk space and reclaim it after deletion or rewrite
 - Basic ATA/IDE primary-master PIO driver with bounded LBA-28 sector reads and writes
 - QEMU data disk at `disk/tinyos.img` (created only if missing; ignored by Git and preserved by `make clean`)
 - Shell commands `diskinfo` and `disktest` for checking the virtual disk and verifying sector read/write
+- Shell command `fscheck <file>` to inspect a file's cluster chain and compare its on-disk metadata and contents
 
 ## Build tools
 
@@ -36,19 +38,25 @@ From the project folder:
 make run
 ```
 
-A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, and `clear`. `alloc` reserves one 4 KiB page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports whether paging is enabled and the mapped limit.
+A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, and `clear`. `alloc` reserves one 4 KiB page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports whether paging is enabled and the mapped limit. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption.
 
 The keyboard uses a US QWERTY scan-code map. Either Shift key changes letters to uppercase and number-row/punctuation keys to their shifted symbols. Caps Lock toggles letter case; holding Shift while Caps Lock is on types lowercase letters. Caps Lock's keyboard LED is not controlled yet. At the TinyOS prompt, check it with `echo Hello`, `echo !@#`, then toggle Caps Lock and type `echo HELLO`; toggle it off afterward.
 
-File commands: `ls` lists entries in the current directory (`/` marks directories), `mkdir <name>` creates a directory, `cd <name>` enters one, `cd ..` goes up, `cd /` returns to the root, and `pwd` prints the current path. `rmdir <name>` removes an empty directory. `touch <name>` creates an empty file, `write <name> <text>` creates or replaces a file (spaces are allowed in the text), `cat <name>` prints it, and `rm <name>` deletes it. Directories and files share a limit of 16 total entries. Names can contain up to 15 characters; file contents can contain up to 4096 characters (8 disk sectors). The shell accepts long command lines so `write` can store content larger than one sector. The current directory starts at `/` after each restart. Metadata and contents are saved on the QEMU virtual disk.
+File commands: `ls` lists entries in the current directory (`/` marks directories), `mkdir <name>` creates a directory, `cd <name>` enters one, `cd ..` goes up, `cd /` returns to the root, and `pwd` prints the current path. `rmdir <name>` removes an empty directory. `touch <name>` creates an empty file, `write <name> <text>` creates or replaces a file (spaces are allowed in the text), `cat <name>` prints it, and `rm <name>` deletes it. `df` shows free space. Directories and files share a limit of 16 total entries. Names can contain up to 15 characters; file contents can contain up to 32768 characters (64 disk sectors). The shell accepts long command lines so `write` can store content larger than one sector. The current directory starts at `/` after each restart. Metadata and contents are saved on the QEMU virtual disk.
 
 Example directory check in the TinyOS prompt: run `mkdir docs`, `cd docs`, `pwd`, `write note saved`, and `cat note`. Then run `cd ..` and `ls`; it should show `docs/`. After restarting TinyOS, run `cd docs` and `cat note` to confirm the directory and file persisted. `rmdir docs` should refuse while `note` exists; remove it with `cd docs`, `rm note`, `cd ..`, then `rmdir docs`.
 
-To check multi-sector files, paste a text value longer than 512 characters after `write long `, then run `cat long`. Restart TinyOS and run `cat long` again; the contents should still match. The maximum stored content is 4096 characters.
+To check multi-sector files, paste a text value longer than 512 characters after `write long `, then run `cat long`. Restart TinyOS and run `cat long` again; the contents should still match. The maximum stored content is 32768 characters. Rewriting a file allocates its new cluster chain before releasing the old chain, so a failed write leaves the previous file contents intact. Deleting a file releases its clusters for reuse. Empty files use no data clusters.
+
+To check dynamic allocation, run `df`, create a file with `write alpha <text longer than 512 characters>`, then run `df` again; used clusters should increase. Run `rm alpha` and `df`; the clusters should be free again. Repeat with a different file name to confirm freed clusters are reusable. Restart TinyOS and check `df` and `cat` to confirm the saved files and allocation counts remain consistent.
+
+To inspect a file interactively, run `fscheck <name>` from the directory containing it. The command prints its cluster chain, checks on-disk directory and allocation-map metadata against the loaded filesystem state, verifies the file's data sectors against the cached contents, and checks for broken links, loops, shared clusters, and orphaned allocations. It reports the first problem it finds; it does not repair disk data.
 
 The ATA driver talks only to QEMU's emulated primary IDE master. `diskinfo` reports whether the virtual disk is ready and its sector count. `disktest` writes and verifies a pattern in reserved sector 4096 of the TinyOS disk image. The image is 16 MiB and is created automatically the first time `make run` is used. It is stored at `disk/tinyos.img`, outside `build/`, so `make clean` keeps it. The test command overwrites that reserved sector each time; do not use this image for other data.
 
-The TinyOS filesystem uses sector 0 for a signature and version, sector 1 for the 16-entry directory, and sectors 2–17 for the first sector of each entry's file data. Additional file sectors occupy a separate fixed extension area at sectors 18–129, with seven extension sectors reserved for each file slot. Each directory entry stores a name, content length, entry type, and parent slot; the root directory uses a reserved parent value. Existing version 1 and 2 disks are upgraded automatically while preserving their files; their first data sectors stay at the same locations. Sector 4096 remains reserved for `disktest`. On first boot, TinyOS initializes the filesystem only if sectors 0–129 are all blank; an unknown signature or non-blank unformatted filesystem area is reported without formatting it. To reset the virtual disk, shut down QEMU, remove `disk/tinyos.img`, and run `make run` to create a fresh blank image. Resetting deletes all saved files.
+Filesystem version 4 uses sector 0 for its signature and version, sector 1 for the 16-entry directory, and sectors 130–145 for a 16-sector FAT-style allocation map. The map has 3950 usable clusters, each one 512-byte disk sector, in LBAs 146–4095. A directory entry records each file's first cluster and cluster count; FAT links let a file's sectors be non-contiguous. Files can therefore share the data area instead of owning fixed per-slot sectors. The metadata also detects invalid chains and duplicate cluster ownership. Clusters orphaned by an interrupted create, rewrite, or delete are reclaimed during startup after all live files have been checked.
+
+TinyOS upgrades version 1, 2, and 3 disks by reading their old fixed-sector files, copying them into the new cluster area, and then writing the new directory and format version. It verifies that the new allocation area is blank before migrating, and reports an error rather than overwriting unknown data. A new filesystem is initialized only if LBAs 0–4095 are blank. Sector 4096 remains reserved for `disktest`. To reset the virtual disk, shut down QEMU, remove `disk/tinyos.img`, and run `make run` to create a fresh blank image. Resetting deletes all saved files.
 
 To build the ISO without starting QEMU:
 
@@ -71,11 +79,12 @@ The ISO is written to `build/tinyos.iso`.
 9. Add a simple in-memory file store. (Complete)
 10. Add a persistent filesystem on the virtual disk. (Complete)
 11. Add persistent directories and navigation commands. (Complete)
-12. Store persistent files across multiple disk sectors, up to 4096 characters. (Complete)
+12. Store persistent files across multiple disk sectors. (Complete; later expanded to 32768 characters)
 13. Handle Shift and Caps Lock in the IRQ1 keyboard input path. (Complete)
-14. (Future) Add a free-space map and dynamically allocated file extents.
+14. Add a FAT-style free-space map and dynamically allocated file clusters. (Complete)
+15. Inspect a file's allocated cluster chain and detect disk corruption interactively with `fscheck`. (Complete)
+16. (Future) Add a read-only filesystem-wide integrity report and a safe repair/recovery workflow.
 
 ## License
 
 TinyOS is released under the [MIT License](LICENSE).
-
