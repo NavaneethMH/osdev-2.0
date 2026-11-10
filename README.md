@@ -21,6 +21,7 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - Shell commands `diskinfo` and `disktest` for checking the virtual disk and verifying sector read/write
 - Shell command `fscheck <file>` to inspect a file's cluster chain and compare its on-disk metadata and contents
 - Shell command `fsck` to audit all directory entries, allocation chains, and file data; confirmed recovery only frees unreferenced clusters
+- Shell command `rename <old> <new>` to rename a file or directory in the current directory without rewriting file data
 
 ## Build tools
 
@@ -43,7 +44,9 @@ A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `memin
 
 The keyboard uses a US QWERTY scan-code map. Either Shift key changes letters to uppercase and number-row/punctuation keys to their shifted symbols. Caps Lock toggles letter case; holding Shift while Caps Lock is on types lowercase letters. Caps Lock's keyboard LED is not controlled yet. At the TinyOS prompt, check it with `echo Hello`, `echo !@#`, then toggle Caps Lock and type `echo HELLO`; toggle it off afterward.
 
-File commands: `ls` lists entries in the current directory (`/` marks directories), `mkdir <name>` creates a directory, `cd <name>` enters one, `cd ..` goes up, `cd /` returns to the root, and `pwd` prints the current path. `rmdir <name>` removes an empty directory. `touch <name>` creates an empty file, `write <name> <text>` creates or replaces a file (spaces are allowed in the text), `cat <name>` prints it, and `rm <name>` deletes it. `df` shows free space. Directories and files share a limit of 16 total entries. Names can contain up to 15 characters; file contents can contain up to 32768 characters (64 disk sectors). The shell accepts long command lines so `write` can store content larger than one sector. The current directory starts at `/` after each restart. Metadata and contents are saved on the QEMU virtual disk.
+File commands: `ls` lists entries in the current directory (`/` marks directories), `mkdir <name>` creates a directory, `cd <name>` enters one, `cd ..` goes up, `cd /` returns to the root, and `pwd` prints the current path. `rmdir <name>` removes an empty directory. `touch <name>` creates an empty file, `write <name> <text>` creates or replaces a file (spaces are allowed in the text), `cat <name>` prints it, and `rm <name>` deletes it. `rename <old> <new>` changes a file or directory's name in the current directory; it refuses a name that already exists there and preserves the file's data clusters. `df` shows free space. Directories and files share a limit of 16 total entries. Names can contain up to 15 characters; file contents can contain up to 32768 characters (64 disk sectors). The shell accepts long command lines so `write` can store content larger than one sector. The current directory starts at `/` after each restart. Metadata and contents are saved on the QEMU virtual disk.
+
+To check renaming, run `write draft keep this text`, `df`, `rename draft final`, `cat final`, and `df` again; the content should remain and cluster usage should not change. `cat draft` should report that the old name is missing. Create a directory with `mkdir olddir`, rename it with `rename olddir newdir`, then run `cd newdir` and `pwd`; the path should show `/newdir`. Try `rename final newdir` to confirm an existing destination name is refused. Restart TinyOS and run `cat final` to confirm the new name persists.
 
 Example directory check in the TinyOS prompt: run `mkdir docs`, `cd docs`, `pwd`, `write note saved`, and `cat note`. Then run `cd ..` and `ls`; it should show `docs/`. After restarting TinyOS, run `cd docs` and `cat note` to confirm the directory and file persisted. `rmdir docs` should refuse while `note` exists; remove it with `cd docs`, `rm note`, `cd ..`, then `rmdir docs`.
 
@@ -87,6 +90,7 @@ The ISO is written to `build/tinyos.iso`.
 14. Add a FAT-style free-space map and dynamically allocated file clusters. (Complete)
 15. Inspect a file's allocated cluster chain and detect disk corruption interactively with `fscheck`. (Complete)
 16. (Complete) Add a read-only filesystem-wide integrity report and a confirmation-gated recovery workflow for orphaned clusters.
+17. (Complete) Add a persistent `rename` command for files and directories that preserves existing data clusters.
 
 ## License
 

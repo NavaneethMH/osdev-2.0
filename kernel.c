@@ -689,6 +689,18 @@ static unsigned int string_length(const char *s)
     return len;
 }
 
+static int strings_equal(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (*a != *b) {
+            return 0;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 /* Returns 1 if the name is valid (non-empty, no spaces, fits in 15 chars). */
 static int file_name_valid(const char *name)
 {
@@ -1105,6 +1117,20 @@ static int filesystem_save_change(unsigned int slot,
         if (result < 0) {
             return result;
         }
+    }
+    return 0;
+}
+
+/* Persist a name-only update without allocating new data clusters or touching
+   the file's existing data chain. */
+static int filesystem_save_metadata_change(unsigned int slot,
+                                           const struct file_entry *previous)
+{
+    int result = filesystem_write_directory();
+    if (result < 0) {
+        file_entry_copy(&files[slot], previous);
+        (void)filesystem_write_directory();
+        return result;
     }
     return 0;
 }
@@ -2478,7 +2504,7 @@ static void run_command(void)
 {
     if (command_is("help")) {
         put_string("Commands: help, about, meminfo, mmap, pages, paging, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
-        put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>\n");
+        put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
         put_string("       fsck checks the full filesystem; fsck repair previews orphan cleanup.\n");
@@ -2602,6 +2628,88 @@ static void run_command(void)
                         put_char('/');
                     }
                     put_char('\n');
+                }
+            }
+        }
+    } else if (command_is("rename") || command_starts_with("rename ")) {
+        if (!file_store_ready) {
+            report_file_store_unavailable();
+        } else {
+            const char *args = command_args_after("rename ");
+            char old_name[FILENAME_MAX_LEN + 1U];
+            char new_name[FILENAME_MAX_LEN + 1U];
+            unsigned int old_length = 0U;
+            unsigned int new_length = 0U;
+
+            if (args == 0) {
+                put_string("Usage: rename <old-name> <new-name>\n");
+            } else {
+                while (args[old_length] != '\0' && args[old_length] != ' ') {
+                    ++old_length;
+                }
+                const char *new_start = args + old_length;
+                while (*new_start == ' ') {
+                    ++new_start;
+                }
+                while (new_start[new_length] != '\0' &&
+                       new_start[new_length] != ' ') {
+                    ++new_length;
+                }
+                const char *extra = new_start + new_length;
+                while (*extra == ' ') {
+                    ++extra;
+                }
+
+                if (old_length == 0U || old_length > FILENAME_MAX_LEN ||
+                    new_length == 0U || new_length > FILENAME_MAX_LEN ||
+                    *extra != '\0') {
+                    put_string("Usage: rename <old-name> <new-name>\n");
+                } else {
+                    for (unsigned int i = 0; i < old_length; ++i) {
+                        old_name[i] = args[i];
+                    }
+                    old_name[old_length] = '\0';
+                    for (unsigned int i = 0; i < new_length; ++i) {
+                        new_name[i] = new_start[i];
+                    }
+                    new_name[new_length] = '\0';
+
+                    if (!file_name_valid(old_name) ||
+                        !file_name_valid(new_name)) {
+                        put_string("Invalid name (max 15 chars; no spaces or slashes).\n");
+                    } else {
+                        int idx = entry_find(old_name, current_directory);
+                        if (idx < 0) {
+                            put_string("Entry not found: ");
+                            put_string(old_name);
+                            put_char('\n');
+                        } else if (strings_equal(old_name, new_name)) {
+                            put_string("Name unchanged: ");
+                            put_string(old_name);
+                            put_char('\n');
+                        } else if (entry_find(new_name, current_directory) >= 0) {
+                            put_string("Name already exists: ");
+                            put_string(new_name);
+                            put_char('\n');
+                        } else {
+                            file_entry_copy(&file_entry_backup, &files[idx]);
+                            copy_string(files[idx].name, FILENAME_MAX_LEN,
+                                        new_name);
+                            int result = filesystem_save_metadata_change(
+                                (unsigned int)idx, &file_entry_backup);
+                            if (result < 0) {
+                                put_string("Rename failed: ");
+                                put_string(file_store_error_message(result));
+                                put_char('\n');
+                            } else {
+                                put_string("Renamed ");
+                                put_string(old_name);
+                                put_string(" to ");
+                                put_string(new_name);
+                                put_char('\n');
+                            }
+                        }
+                    }
                 }
             }
         }
