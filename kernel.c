@@ -1684,6 +1684,403 @@ static void inspect_file_chain(unsigned int slot)
     put_string("\nFilesystem check passed: directory, chains, and file data match.\n");
 }
 
+struct filesystem_audit_summary {
+    unsigned int entries;
+    unsigned int files;
+    unsigned int directories;
+    unsigned int clusters_checked;
+    unsigned int errors;
+    unsigned int orphans;
+    int scan_complete;
+};
+
+static void filesystem_audit_error(struct filesystem_audit_summary *summary,
+                                   const char *message)
+{
+    ++summary->errors;
+    put_string("ERROR: ");
+    put_string(message);
+    put_char('\n');
+}
+
+static unsigned char filesystem_expected_entry_byte(unsigned int slot,
+                                                     unsigned int length,
+                                                     unsigned int byte)
+{
+    const struct file_entry *file = &files[slot];
+    if (!file->used) {
+        return 0U;
+    }
+    if (byte <= FILENAME_MAX_LEN) {
+        return (unsigned char)file->name[byte];
+    }
+    switch (byte) {
+        case 16U: return (unsigned char)(length & 0xFFU);
+        case 17U: return (unsigned char)((length >> 8) & 0xFFU);
+        case 18U: return 1U;
+        case 19U: return file->is_directory
+            ? ENTRY_TYPE_DIRECTORY : ENTRY_TYPE_FILE;
+        case 20U: return file->parent;
+        case 21U: return (unsigned char)(file->first_cluster & 0xFFU);
+        case 22U: return (unsigned char)(file->first_cluster >> 8);
+        case 23U: return (unsigned char)(file->cluster_count & 0xFFU);
+        case 24U: return (unsigned char)(file->cluster_count >> 8);
+        default: return 0U;
+    }
+}
+
+static int filesystem_bounded_content_length(const char *content,
+                                              unsigned int *length)
+{
+    for (unsigned int i = 0; i <= FILE_CONTENT_MAX; ++i) {
+        if (content[i] == '\0') {
+            *length = i;
+            return 1;
+        }
+    }
+    *length = 0U;
+    return 0;
+}
+
+static void filesystem_run_audit(struct filesystem_audit_summary *summary)
+{
+    unsigned int lengths[MAX_FILES];
+    unsigned char content_valid[MAX_FILES];
+
+    summary->entries = 0U;
+    summary->files = 0U;
+    summary->directories = 0U;
+    summary->clusters_checked = 0U;
+    summary->errors = 0U;
+    summary->orphans = 0U;
+    summary->scan_complete = 0;
+
+    int result = disk_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U,
+                                   filesystem_scan_buffer);
+    if (result < 0) {
+        filesystem_audit_error(summary, "could not read the directory sector.");
+        put_string(disk_error_string(result));
+        put_char('\n');
+        return;
+    }
+
+    for (unsigned int slot = 0; slot < MAX_FILES; ++slot) {
+        lengths[slot] = 0U;
+        content_valid[slot] = 1U;
+        if (files[slot].used) {
+            ++summary->entries;
+            if (files[slot].used != 1 ||
+                (files[slot].is_directory != 0 &&
+                 files[slot].is_directory != 1)) {
+                filesystem_audit_error(summary,
+                                       "an entry has an invalid in-memory type flag.");
+            }
+            if (files[slot].is_directory) {
+                ++summary->directories;
+            } else {
+                ++summary->files;
+            }
+            if (!filesystem_bounded_content_length(files[slot].content,
+                                                   &lengths[slot])) {
+                content_valid[slot] = 0U;
+                filesystem_audit_error(summary,
+                                       "a file content buffer is not terminated.");
+            }
+
+            int name_terminated = 0;
+            for (unsigned int i = 0; i <= FILENAME_MAX_LEN; ++i) {
+                if (files[slot].name[i] == '\0') {
+                    name_terminated = 1;
+                    break;
+                }
+            }
+            if (!name_terminated || !file_name_valid(files[slot].name)) {
+                filesystem_audit_error(summary,
+                                       "a directory entry has an invalid name.");
+            }
+            if (files[slot].is_directory && lengths[slot] != 0U) {
+                filesystem_audit_error(summary,
+                                       "a directory entry contains file data.");
+            }
+            if (files[slot].parent != FILE_PARENT_ROOT &&
+                (files[slot].parent >= MAX_FILES ||
+                 !files[files[slot].parent].used ||
+                 !files[files[slot].parent].is_directory ||
+                 files[slot].parent == slot)) {
+                filesystem_audit_error(summary,
+                                       "a directory entry has an invalid parent.");
+            }
+            unsigned int ancestor = files[slot].parent;
+            for (unsigned int depth = 0;
+                 ancestor != FILE_PARENT_ROOT && ancestor < MAX_FILES;
+                 ++depth) {
+                if (depth >= MAX_FILES || ancestor == slot) {
+                    filesystem_audit_error(summary,
+                                           "the directory tree contains a cycle.");
+                    break;
+                }
+                ancestor = files[ancestor].parent;
+            }
+            for (unsigned int other = 0; other < slot; ++other) {
+                if (!files[other].used ||
+                    files[other].parent != files[slot].parent) {
+                    continue;
+                }
+                unsigned int i = 0U;
+                while (i <= FILENAME_MAX_LEN &&
+                       files[other].name[i] == files[slot].name[i] &&
+                       files[slot].name[i] != '\0') {
+                    ++i;
+                }
+                if (i <= FILENAME_MAX_LEN &&
+                    files[other].name[i] == '\0' &&
+                    files[slot].name[i] == '\0') {
+                    filesystem_audit_error(summary,
+                                           "duplicate names exist in one directory.");
+                    break;
+                }
+            }
+        }
+
+        unsigned int offset = slot * FILESYSTEM_ENTRY_SIZE;
+        for (unsigned int byte = 0; byte < FILESYSTEM_ENTRY_SIZE; ++byte) {
+            unsigned char expected = filesystem_expected_entry_byte(
+                slot, lengths[slot], byte);
+            if (filesystem_scan_buffer[offset + byte] != expected) {
+                filesystem_audit_error(summary,
+                                       "a directory entry differs from the disk.");
+                break;
+            }
+        }
+    }
+
+    result = disk_read_sectors(FILESYSTEM_FAT_LBA, FILESYSTEM_FAT_SECTORS,
+                               filesystem_fat_disk);
+    if (result < 0) {
+        filesystem_audit_error(summary,
+                               "could not read the allocation map.");
+        put_string(disk_error_string(result));
+        put_char('\n');
+        return;
+    }
+
+    int allocation_map_matches = 1;
+    for (unsigned int i = 0; i < FILESYSTEM_FAT_ENTRIES; ++i) {
+        unsigned short disk_value =
+            (unsigned short)filesystem_fat_disk[i * 2U] |
+            ((unsigned short)filesystem_fat_disk[i * 2U + 1U] << 8);
+        if (disk_value != filesystem_fat[i]) {
+            if (allocation_map_matches) {
+                filesystem_audit_error(summary,
+                                       "the on-disk allocation map differs from memory.");
+                put_string("First differing allocation entry: ");
+                put_unsigned(i);
+                put_char('\n');
+            }
+            allocation_map_matches = 0;
+        }
+        if ((i < FILESYSTEM_CLUSTER_COUNT &&
+             disk_value != FILESYSTEM_CLUSTER_FREE &&
+             disk_value != FILESYSTEM_CLUSTER_END &&
+             disk_value >= FILESYSTEM_CLUSTER_COUNT) ||
+            (i >= FILESYSTEM_CLUSTER_COUNT &&
+             disk_value != FILESYSTEM_CLUSTER_FREE)) {
+            filesystem_audit_error(summary,
+                                   "the allocation map contains an invalid value.");
+            allocation_map_matches = 0;
+        }
+    }
+    if (!allocation_map_matches) {
+        return;
+    }
+
+    for (unsigned int i = 0; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
+        filesystem_cluster_seen[i] = 0U;
+    }
+    for (unsigned int slot = 0; slot < MAX_FILES; ++slot) {
+        if (!files[slot].used) {
+            continue;
+        }
+        if (files[slot].is_directory) {
+            if (files[slot].cluster_count != 0U ||
+                files[slot].first_cluster != FILESYSTEM_CLUSTER_FREE) {
+                filesystem_audit_error(summary,
+                                       "a directory has allocated data clusters.");
+            }
+            continue;
+        }
+        if (!content_valid[slot]) {
+            continue;
+        }
+
+        unsigned int expected_count = lengths[slot] == 0U ? 0U :
+            (lengths[slot] + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
+        if (files[slot].cluster_count != expected_count ||
+            (expected_count == 0U &&
+             files[slot].first_cluster != FILESYSTEM_CLUSTER_FREE) ||
+            (expected_count != 0U &&
+             files[slot].first_cluster >= FILESYSTEM_CLUSTER_COUNT)) {
+            filesystem_audit_error(summary,
+                                   "file size and cluster metadata disagree.");
+            continue;
+        }
+
+        unsigned short cluster = files[slot].first_cluster;
+        unsigned int content_offset = 0U;
+        for (unsigned int i = 0; i < expected_count; ++i) {
+            if (cluster >= FILESYSTEM_CLUSTER_COUNT ||
+                filesystem_cluster_seen[cluster] ||
+                filesystem_fat[cluster] == FILESYSTEM_CLUSTER_FREE) {
+                filesystem_audit_error(summary,
+                                       "a file chain contains a loop or shared cluster.");
+                break;
+            }
+            filesystem_cluster_seen[cluster] = 1U;
+            ++summary->clusters_checked;
+
+            unsigned short next = filesystem_fat[cluster];
+            if (i + 1U == expected_count) {
+                if (next != FILESYSTEM_CLUSTER_END) {
+                    filesystem_audit_error(summary,
+                                           "a file chain does not end at its expected length.");
+                    break;
+                }
+            } else if (next == FILESYSTEM_CLUSTER_END ||
+                       next == FILESYSTEM_CLUSTER_FREE ||
+                       next >= FILESYSTEM_CLUSTER_COUNT) {
+                filesystem_audit_error(summary,
+                                       "a file chain has a broken link.");
+                break;
+            }
+
+            result = disk_read_sectors(filesystem_cluster_lba(cluster), 1U,
+                                       filesystem_fat_disk);
+            if (result < 0) {
+                filesystem_audit_error(summary,
+                                       "could not read a file data sector.");
+                put_string(disk_error_string(result));
+                put_char('\n');
+                content_offset = lengths[slot];
+                break;
+            }
+            unsigned int bytes_here = lengths[slot] - content_offset;
+            if (bytes_here > DISK_SECTOR_SIZE) {
+                bytes_here = DISK_SECTOR_SIZE;
+            }
+            int data_matches = 1;
+            for (unsigned int byte = 0; byte < bytes_here; ++byte) {
+                if (filesystem_fat_disk[byte] !=
+                    (unsigned char)files[slot].content[content_offset + byte]) {
+                    data_matches = 0;
+                    break;
+                }
+            }
+            for (unsigned int byte = bytes_here;
+                 data_matches && byte < DISK_SECTOR_SIZE; ++byte) {
+                if (filesystem_fat_disk[byte] != 0U) {
+                    data_matches = 0;
+                }
+            }
+            if (!data_matches) {
+                filesystem_audit_error(summary,
+                                       "a file data sector differs from its contents.");
+            }
+            content_offset += bytes_here;
+            cluster = next;
+        }
+    }
+
+    for (unsigned int i = 0; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
+        if (filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE &&
+            !filesystem_cluster_seen[i]) {
+            ++summary->orphans;
+        }
+    }
+    summary->scan_complete = 1;
+}
+
+static void show_filesystem_audit_summary(
+    const struct filesystem_audit_summary *summary)
+{
+    put_string("Entries checked: ");
+    put_unsigned(summary->entries);
+    put_string(" (files: ");
+    put_unsigned(summary->files);
+    put_string(", directories: ");
+    put_unsigned(summary->directories);
+    put_string(")\nClusters checked: ");
+    put_unsigned(summary->clusters_checked);
+    put_string("\nErrors: ");
+    put_unsigned(summary->errors);
+    put_string("\nUnreferenced allocated clusters: ");
+    put_unsigned(summary->orphans);
+    put_char('\n');
+    if (summary->scan_complete && summary->errors == 0U &&
+        summary->orphans == 0U) {
+        put_string("Filesystem is clean.\n");
+    } else if (summary->scan_complete && summary->errors == 0U) {
+        put_string("Only unreferenced clusters were found. Run fsck repair to preview safe cleanup.\n");
+    } else {
+        put_string("Filesystem has errors; automatic repair is disabled.\n");
+    }
+}
+
+static void run_filesystem_check(void)
+{
+    struct filesystem_audit_summary summary;
+    put_string("Read-only filesystem check:\n");
+    filesystem_run_audit(&summary);
+    show_filesystem_audit_summary(&summary);
+}
+
+static void run_filesystem_repair_preview(int confirm)
+{
+    struct filesystem_audit_summary summary;
+    put_string("Filesystem repair safety check:\n");
+    filesystem_run_audit(&summary);
+    show_filesystem_audit_summary(&summary);
+    if (!summary.scan_complete || summary.errors != 0U) {
+        put_string("Repair refused: resolve filesystem errors before cleanup.\n");
+        return;
+    }
+    if (summary.orphans == 0U) {
+        put_string("No orphaned clusters need cleanup.\n");
+        return;
+    }
+    if (!confirm) {
+        put_string("Preview: only unreferenced clusters would be marked free.\n");
+        put_string("To apply this repair, enter: fsck repair confirm\n");
+        return;
+    }
+
+    unsigned int reclaimed = 0U;
+    for (unsigned int i = 0; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
+        if (filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE &&
+            !filesystem_cluster_seen[i]) {
+            filesystem_fat[i] = FILESYSTEM_CLUSTER_FREE;
+            ++reclaimed;
+        }
+    }
+    int result = filesystem_write_fat();
+    if (result < 0) {
+        int reload_result = filesystem_load_fat();
+        put_string("Repair write failed: ");
+        put_string(disk_error_string(result));
+        put_char('\n');
+        if (reload_result < 0) {
+            file_store_ready = 0;
+            file_store_error = reload_result;
+            put_string("Could not reload the allocation map; file commands are disabled until reboot.\n");
+        } else {
+            put_string("Allocation map reloaded. Run fsck again to inspect the result.\n");
+        }
+        return;
+    }
+    put_string("Repair complete: reclaimed ");
+    put_unsigned(reclaimed);
+    put_string(" unreferenced clusters; file contents were not changed.\n");
+}
+
 /* --- End file store helpers --- */
 
 static struct idt_entry idt[256];
@@ -2080,10 +2477,11 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, meminfo, mmap, pages, paging, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, clear, echo <text>\n");
+        put_string("Commands: help, about, meminfo, mmap, pages, paging, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
+        put_string("       fsck checks the full filesystem; fsck repair previews orphan cleanup.\n");
         put_string("Files persist on disk; 16 entries, 15-char names, up to 32768 chars per file.\n");
         put_string("Disk space is shared dynamically; remove or shrink files to free clusters.\n");
         put_string("Type a command and press Enter.\n");
@@ -2129,6 +2527,26 @@ static void run_command(void)
                 inspect_file_chain((unsigned int)idx);
             }
         }
+    } else if (command_is("fsck repair confirm")) {
+        if (!file_store_ready) {
+            report_file_store_unavailable();
+        } else {
+            run_filesystem_repair_preview(1);
+        }
+    } else if (command_is("fsck repair")) {
+        if (!file_store_ready) {
+            report_file_store_unavailable();
+        } else {
+            run_filesystem_repair_preview(0);
+        }
+    } else if (command_is("fsck")) {
+        if (!file_store_ready) {
+            report_file_store_unavailable();
+        } else {
+            run_filesystem_check();
+        }
+    } else if (command_starts_with("fsck ")) {
+        put_string("Usage: fsck, fsck repair, or fsck repair confirm\n");
     } else if (command_is("alloc")) {
         unsigned int page = allocate_page();
         if (page == 0U) {

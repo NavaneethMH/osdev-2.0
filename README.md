@@ -20,6 +20,7 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - QEMU data disk at `disk/tinyos.img` (created only if missing; ignored by Git and preserved by `make clean`)
 - Shell commands `diskinfo` and `disktest` for checking the virtual disk and verifying sector read/write
 - Shell command `fscheck <file>` to inspect a file's cluster chain and compare its on-disk metadata and contents
+- Shell command `fsck` to audit all directory entries, allocation chains, and file data; confirmed recovery only frees unreferenced clusters
 
 ## Build tools
 
@@ -38,7 +39,7 @@ From the project folder:
 make run
 ```
 
-A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, and `clear`. `alloc` reserves one 4 KiB page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports whether paging is enabled and the mapped limit. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption.
+A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, `fsck`, and `clear`. `alloc` reserves one 4 KiB page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports whether paging is enabled and the mapped limit. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption. `fsck` checks every directory entry, file chain, and saved data sector, and reports any unreferenced allocated clusters.
 
 The keyboard uses a US QWERTY scan-code map. Either Shift key changes letters to uppercase and number-row/punctuation keys to their shifted symbols. Caps Lock toggles letter case; holding Shift while Caps Lock is on types lowercase letters. Caps Lock's keyboard LED is not controlled yet. At the TinyOS prompt, check it with `echo Hello`, `echo !@#`, then toggle Caps Lock and type `echo HELLO`; toggle it off afterward.
 
@@ -51,6 +52,8 @@ To check multi-sector files, paste a text value longer than 512 characters after
 To check dynamic allocation, run `df`, create a file with `write alpha <text longer than 512 characters>`, then run `df` again; used clusters should increase. Run `rm alpha` and `df`; the clusters should be free again. Repeat with a different file name to confirm freed clusters are reusable. Restart TinyOS and check `df` and `cat` to confirm the saved files and allocation counts remain consistent.
 
 To inspect a file interactively, run `fscheck <name>` from the directory containing it. The command prints its cluster chain, checks on-disk directory and allocation-map metadata against the loaded filesystem state, verifies the file's data sectors against the cached contents, and checks for broken links, loops, shared clusters, and orphaned allocations. It reports the first problem it finds; it does not repair disk data.
+
+To audit the whole filesystem, run `fsck`. It checks the directory table, file sizes and cluster chains, ownership of every allocated cluster, and saved data against the in-memory copy. `fsck repair` performs the same checks and previews recovery only when the sole issue is unreferenced allocated clusters. Review the count; only then run `fsck repair confirm` to mark those clusters free. Repair refuses to run if it finds other errors and never changes file data sectors. Back up `disk/tinyos.img` before experimenting with disk recovery.
 
 The ATA driver talks only to QEMU's emulated primary IDE master. `diskinfo` reports whether the virtual disk is ready and its sector count. `disktest` writes and verifies a pattern in reserved sector 4096 of the TinyOS disk image. The image is 16 MiB and is created automatically the first time `make run` is used. It is stored at `disk/tinyos.img`, outside `build/`, so `make clean` keeps it. The test command overwrites that reserved sector each time; do not use this image for other data.
 
@@ -83,7 +86,7 @@ The ISO is written to `build/tinyos.iso`.
 13. Handle Shift and Caps Lock in the IRQ1 keyboard input path. (Complete)
 14. Add a FAT-style free-space map and dynamically allocated file clusters. (Complete)
 15. Inspect a file's allocated cluster chain and detect disk corruption interactively with `fscheck`. (Complete)
-16. (Future) Add a read-only filesystem-wide integrity report and a safe repair/recovery workflow.
+16. (Complete) Add a read-only filesystem-wide integrity report and a confirmation-gated recovery workflow for orphaned clusters.
 
 ## License
 

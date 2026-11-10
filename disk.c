@@ -26,6 +26,12 @@
 #define ATA_LBA28_LIMIT 0x10000000U
 
 enum {
+    ATA_WAIT_NOT_BUSY = 0,
+    ATA_WAIT_DATA = 1,
+    ATA_WAIT_READY = 2
+};
+
+enum {
     DISK_ERR_NO_DEVICE = -1,
     DISK_ERR_TIMEOUT = -2,
     DISK_ERR_DEVICE = -3,
@@ -71,9 +77,10 @@ static void ata_delay_400ns(void)
     (void)inb(ATA_ALT_STATUS);
 }
 
-/* Wait for BSY to clear. Data phases require DRQ; completion phases require
-   the drive to be ready with DRQ clear before another command is issued. */
-static int ata_wait(int require_data)
+/* Pre-command waits only require BSY clear. Requiring DRDY/DRQ state there
+   can deadlock on emulated IDE devices after a read; completion waits use the
+   stricter ready-without-data state, while data phases wait for DRQ. */
+static int ata_wait(int mode)
 {
     for (unsigned int i = 0; i < ATA_POLL_LIMIT; ++i) {
         unsigned char status = inb(ATA_STATUS);
@@ -87,10 +94,10 @@ static int ata_wait(int require_data)
             (void)inb(ATA_ERROR);
             return DISK_ERR_DEVICE;
         }
-        if (require_data && (status & ATA_STATUS_DRQ) == 0U) {
+        if (mode == ATA_WAIT_DATA && (status & ATA_STATUS_DRQ) == 0U) {
             continue;
         }
-        if (!require_data &&
+        if (mode == ATA_WAIT_READY &&
             ((status & ATA_STATUS_DRDY) == 0U ||
              (status & ATA_STATUS_DRQ) != 0U)) {
             continue;
@@ -127,7 +134,7 @@ int disk_initialize(void)
         return initialization_result;
     }
 
-    int result = ata_wait(1);
+    int result = ata_wait(ATA_WAIT_DATA);
     if (result != 0) {
         initialization_result = result;
         return initialization_result;
@@ -210,13 +217,13 @@ int disk_read_sectors(unsigned int lba, unsigned int count,
     }
 
     for (unsigned int sector = 0; sector < count; ++sector) {
-        result = ata_wait(0);
+        result = ata_wait(ATA_WAIT_NOT_BUSY);
         if (result != 0) {
             return result;
         }
         ata_program_lba(lba + sector);
         outb(ATA_COMMAND, ATA_CMD_READ);
-        result = ata_wait(1);
+        result = ata_wait(ATA_WAIT_DATA);
         if (result != 0) {
             return result;
         }
@@ -240,13 +247,13 @@ int disk_write_sectors(unsigned int lba, unsigned int count,
     }
 
     for (unsigned int sector = 0; sector < count; ++sector) {
-        result = ata_wait(0);
+        result = ata_wait(ATA_WAIT_NOT_BUSY);
         if (result != 0) {
             return result;
         }
         ata_program_lba(lba + sector);
         outb(ATA_COMMAND, ATA_CMD_WRITE);
-        result = ata_wait(1);
+        result = ata_wait(ATA_WAIT_DATA);
         if (result != 0) {
             return result;
         }
@@ -256,14 +263,14 @@ int disk_write_sectors(unsigned int lba, unsigned int count,
                 ((unsigned short)buffer[offset + 1U] << 8);
             outw(ATA_DATA, value);
         }
-        result = ata_wait(0);
+        result = ata_wait(ATA_WAIT_READY);
         if (result != 0) {
             return result;
         }
     }
 
     outb(ATA_COMMAND, ATA_CMD_FLUSH);
-    result = ata_wait(0);
+    result = ata_wait(ATA_WAIT_READY);
     return result == 0 ? (int)count : result;
 }
 
