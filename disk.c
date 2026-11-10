@@ -23,6 +23,7 @@
 #define ATA_CMD_FLUSH    0xE7U
 
 #define ATA_POLL_LIMIT 1000000U
+#define ATA_INTERRUPT_WAIT_LIMIT 1000U
 #define ATA_LBA28_LIMIT 0x10000000U
 
 enum {
@@ -77,17 +78,36 @@ static void ata_delay_400ns(void)
     (void)inb(ATA_ALT_STATUS);
 }
 
+/* When interrupts are enabled, halt between status polls so QEMU's host-side
+   disk I/O can complete. During early boot, use a CPU pause instead. */
+static void ata_wait_step(unsigned int *interrupt_waits)
+{
+    unsigned int eflags;
+    __asm__ volatile ("pushfl; popl %0" : "=r"(eflags));
+    if ((eflags & (1U << 9)) != 0U) {
+        __asm__ volatile ("hlt");
+        ++*interrupt_waits;
+    } else {
+        __asm__ volatile ("pause");
+    }
+}
+
 /* Pre-command waits only require BSY clear. Requiring DRDY/DRQ state there
    can deadlock on emulated IDE devices after a read; completion waits use the
    stricter ready-without-data state, while data phases wait for DRQ. */
 static int ata_wait(int mode)
 {
+    unsigned int interrupt_waits = 0U;
     for (unsigned int i = 0; i < ATA_POLL_LIMIT; ++i) {
         unsigned char status = inb(ATA_STATUS);
         if (status == 0U || status == 0xFFU) {
             return DISK_ERR_NO_DEVICE;
         }
         if ((status & ATA_STATUS_BSY) != 0U) {
+            ata_wait_step(&interrupt_waits);
+            if (interrupt_waits >= ATA_INTERRUPT_WAIT_LIMIT) {
+                return DISK_ERR_TIMEOUT;
+            }
             continue;
         }
         if ((status & (ATA_STATUS_ERR | ATA_STATUS_DF)) != 0U) {
@@ -95,11 +115,19 @@ static int ata_wait(int mode)
             return DISK_ERR_DEVICE;
         }
         if (mode == ATA_WAIT_DATA && (status & ATA_STATUS_DRQ) == 0U) {
+            ata_wait_step(&interrupt_waits);
+            if (interrupt_waits >= ATA_INTERRUPT_WAIT_LIMIT) {
+                return DISK_ERR_TIMEOUT;
+            }
             continue;
         }
         if (mode == ATA_WAIT_READY &&
             ((status & ATA_STATUS_DRDY) == 0U ||
              (status & ATA_STATUS_DRQ) != 0U)) {
+            ata_wait_step(&interrupt_waits);
+            if (interrupt_waits >= ATA_INTERRUPT_WAIT_LIMIT) {
+                return DISK_ERR_TIMEOUT;
+            }
             continue;
         }
         return 0;
