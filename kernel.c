@@ -13,6 +13,8 @@
 #define MAX_TRACKED_PAGES 256U
 #define KEYBOARD_BUFFER_SIZE 256U
 #define PAGING_MAPPED_LIMIT 0x02000000U /* First 32 MiB identity-mapped. */
+#define VM_DYNAMIC_TABLES 8U
+#define VM_TEST_VIRTUAL_ADDRESS 0x40000000U
 #define MAX_FILES 16U
 #define FILENAME_MAX_LEN 15U
 #define FILE_CONTENT_MAX 32768U
@@ -157,6 +159,11 @@ static volatile int keyboard_caps_lock = 0;
 static unsigned int page_directory[1024] __attribute__((aligned(4096)));
 static unsigned int page_tables[PAGE_TABLES_FOR_LIMIT][1024]
     __attribute__((aligned(4096)));
+static unsigned int dynamic_page_tables[VM_DYNAMIC_TABLES][1024]
+    __attribute__((aligned(4096)));
+static unsigned int dynamic_page_table_directory[VM_DYNAMIC_TABLES];
+static int dynamic_page_table_used[VM_DYNAMIC_TABLES];
+static unsigned int dynamic_mapped_pages = 0U;
 static int paging_enabled = 0;
 
 /* File metadata and contents are cached in RAM and backed by the QEMU disk. */
@@ -417,6 +424,11 @@ static void initialize_paging(void)
     for (unsigned int i = 0; i < 1024U; ++i) {
         page_directory[i] = 0;
     }
+    for (unsigned int i = 0U; i < VM_DYNAMIC_TABLES; ++i) {
+        dynamic_page_table_directory[i] = 0U;
+        dynamic_page_table_used[i] = 0;
+    }
+    dynamic_mapped_pages = 0U;
 
     /* Fill each of the 8 page tables and wire them into the directory. */
     for (unsigned int table = 0; table < PAGE_TABLES_FOR_LIMIT; ++table) {
@@ -443,6 +455,120 @@ static void initialize_paging(void)
     __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
 
     paging_enabled = 1;
+}
+
+static void invalidate_page(unsigned int virtual_address)
+{
+    __asm__ volatile ("invlpg (%0)" : : "r"(virtual_address) : "memory");
+}
+
+/* Find or create one of the bounded page tables used for non-identity maps. */
+static int dynamic_table_for(unsigned int directory_index, int create,
+                             unsigned int **table)
+{
+    if ((page_directory[directory_index] & 0x01U) != 0U) {
+        unsigned int physical = page_directory[directory_index] & 0xFFFFF000U;
+        for (unsigned int i = 0U; i < VM_DYNAMIC_TABLES; ++i) {
+            if (dynamic_page_table_used[i] &&
+                dynamic_page_table_directory[i] == directory_index &&
+                (unsigned int)&dynamic_page_tables[i][0] == physical) {
+                *table = dynamic_page_tables[i];
+                return (int)i;
+            }
+        }
+        return -1;
+    }
+    if (!create) {
+        return -1;
+    }
+
+    for (unsigned int i = 0U; i < VM_DYNAMIC_TABLES; ++i) {
+        if (dynamic_page_table_used[i]) {
+            continue;
+        }
+        for (unsigned int entry = 0U; entry < 1024U; ++entry) {
+            dynamic_page_tables[i][entry] = 0U;
+        }
+        dynamic_page_table_directory[i] = directory_index;
+        dynamic_page_table_used[i] = 1;
+        page_directory[directory_index] =
+            (unsigned int)&dynamic_page_tables[i][0] | 0x03U;
+        *table = dynamic_page_tables[i];
+        return (int)i;
+    }
+    return -1;
+}
+
+static int vm_map_page(unsigned int virtual_address, unsigned int physical_address)
+{
+    if (!paging_enabled || virtual_address < PAGING_MAPPED_LIMIT ||
+        (virtual_address & (PAGE_SIZE - 1U)) != 0U ||
+        (physical_address & (PAGE_SIZE - 1U)) != 0U ||
+        physical_address >= PAGING_MAPPED_LIMIT) {
+        return 0;
+    }
+
+    unsigned int directory_index = virtual_address >> 22;
+    unsigned int table_index = (virtual_address >> 12) & 0x3FFU;
+    unsigned int *table = 0;
+    if (dynamic_table_for(directory_index, 1, &table) < 0 ||
+        (table[table_index] & 0x01U) != 0U) {
+        return 0;
+    }
+
+    /* Present and writable; supervisor-only. */
+    table[table_index] = physical_address | 0x03U;
+    ++dynamic_mapped_pages;
+    invalidate_page(virtual_address);
+    return 1;
+}
+
+static int vm_page_is_mapped(unsigned int virtual_address)
+{
+    unsigned int directory_index = virtual_address >> 22;
+    unsigned int table_index = (virtual_address >> 12) & 0x3FFU;
+    unsigned int *table = 0;
+    if (directory_index >= 1024U ||
+        dynamic_table_for(directory_index, 0, &table) < 0) {
+        return 0;
+    }
+    return (table[table_index] & 0x01U) != 0U;
+}
+
+static int vm_unmap_page(unsigned int virtual_address)
+{
+    if (!paging_enabled || virtual_address < PAGING_MAPPED_LIMIT ||
+        (virtual_address & (PAGE_SIZE - 1U)) != 0U) {
+        return 0;
+    }
+
+    unsigned int directory_index = virtual_address >> 22;
+    unsigned int table_index = (virtual_address >> 12) & 0x3FFU;
+    unsigned int *table = 0;
+    int slot = dynamic_table_for(directory_index, 0, &table);
+    if (slot < 0 || (table[table_index] & 0x01U) == 0U) {
+        return 0;
+    }
+
+    table[table_index] = 0U;
+    if (dynamic_mapped_pages > 0U) {
+        --dynamic_mapped_pages;
+    }
+    invalidate_page(virtual_address);
+
+    int empty = 1;
+    for (unsigned int i = 0U; i < 1024U; ++i) {
+        if ((table[i] & 0x01U) != 0U) {
+            empty = 0;
+            break;
+        }
+    }
+    if (empty) {
+        page_directory[directory_index] = 0U;
+        dynamic_page_table_used[(unsigned int)slot] = 0;
+        dynamic_page_table_directory[(unsigned int)slot] = 0U;
+    }
+    return 1;
 }
 
 static unsigned int allocate_page(void)
@@ -529,6 +655,63 @@ static int release_page(unsigned int address)
     }
 
     return 0;
+}
+
+static void show_vm_info(void)
+{
+    unsigned int used_tables = 0U;
+    for (unsigned int i = 0U; i < VM_DYNAMIC_TABLES; ++i) {
+        if (dynamic_page_table_used[i]) {
+            ++used_tables;
+        }
+    }
+    put_string("Virtual memory: ");
+    put_string(paging_enabled ? "enabled\n" : "disabled\n");
+    put_string("Identity map: first ");
+    put_unsigned(PAGING_MAPPED_LIMIT / 0x100000U);
+    put_string(" MiB\nDynamic pages mapped: ");
+    put_unsigned(dynamic_mapped_pages);
+    put_string("\nDynamic page tables in use: ");
+    put_unsigned(used_tables);
+    put_string(" / ");
+    put_unsigned(VM_DYNAMIC_TABLES);
+    put_char('\n');
+}
+
+static void run_vm_test(void)
+{
+    const unsigned int first_pattern = 0x13579BDFU;
+    const unsigned int second_pattern = 0x2468ACE0U;
+    unsigned int physical = allocate_page();
+    if (physical == 0U) {
+        put_string("VM test failed: no physical page available.\n");
+        return;
+    }
+
+    if (!vm_map_page(VM_TEST_VIRTUAL_ADDRESS, physical)) {
+        (void)release_page(physical);
+        put_string("VM test failed: could not create the virtual mapping.\n");
+        return;
+    }
+
+    volatile unsigned int *identity = (volatile unsigned int *)physical;
+    volatile unsigned int *alias =
+        (volatile unsigned int *)VM_TEST_VIRTUAL_ADDRESS;
+    identity[0] = first_pattern;
+    int alias_reads_identity = vm_page_is_mapped(VM_TEST_VIRTUAL_ADDRESS) &&
+                              alias[0] == first_pattern;
+    alias[1] = second_pattern;
+    int identity_reads_alias = identity[1] == second_pattern;
+    int unmap_ok = vm_unmap_page(VM_TEST_VIRTUAL_ADDRESS);
+    int mapping_removed = !vm_page_is_mapped(VM_TEST_VIRTUAL_ADDRESS);
+    int page_released = unmap_ok && release_page(physical);
+
+    if (alias_reads_identity && identity_reads_alias && unmap_ok &&
+        mapping_removed && page_released) {
+        put_string("VM test passed: mapped alias reads/writes physical page; unmap and cleanup succeeded.\n");
+    } else {
+        put_string("VM test failed: alias read/write, unmap, or cleanup check failed.\n");
+    }
 }
 
 static unsigned char inb(unsigned short port)
@@ -2395,7 +2578,7 @@ static void show_paging(void)
         put_string("Paging: enabled\n");
         put_string("Identity-mapped first ");
         put_unsigned(PAGING_MAPPED_LIMIT / 0x100000U);
-        put_string(" MiB with 4 KiB pages.\n");
+        put_string(" MiB with 4 KiB pages; dynamic page mappings are available.\n");
     } else {
         put_string("Paging: disabled\n");
     }
@@ -2604,7 +2787,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, meminfo, mmap, pages, paging, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, meminfo, mmap, pages, paging, vminfo, vmtest, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -2626,6 +2809,10 @@ static void run_command(void)
         show_pages();
     } else if (command_is("paging")) {
         show_paging();
+    } else if (command_is("vminfo")) {
+        show_vm_info();
+    } else if (command_is("vmtest")) {
+        run_vm_test();
     } else if (command_is("heapinfo")) {
         show_heap_info();
     } else if (command_is("heapcheck")) {
