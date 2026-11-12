@@ -99,10 +99,13 @@ isr_common:
 
 irq_common:
     pusha                     ; Save all general-purpose registers (8 × 4 = 32 bytes)
-    mov eax, [esp + 32]      ; IRQ number: 32 bytes (pusha) offset
-    push eax                  ; Push IRQ number as C argument
+    mov eax, esp              ; Preserve the complete frame for the C scheduler
+    mov edx, [esp + 32]       ; IRQ vector: 32 bytes (pusha) offset
+    push eax                  ; Second argument: saved register-frame pointer
+    push edx                  ; First argument: IRQ vector
     call irq_handler
-    add esp, 4                ; Clean up C argument
+    add esp, 8                ; Clean up C arguments
+    mov esp, eax              ; Restore the selected task's interrupt frame
     popa                      ; Restore all general-purpose registers
     add esp, 8                ; Remove pushed error code and IRQ number
     iret                      ; Return from interrupt
@@ -113,7 +116,9 @@ idt_load:
     lidt [eax]
     ret
 
-; Save callee-saved registers and the current stack, then restore another task.
+; Save the callee-saved registers and stack pointer for the current task,
+; then restore another task's stack. The restored stack ends in a return
+; address, so this works both for resumed tasks and freshly prepared stacks.
 global task_switch
 task_switch:
     push ebp
