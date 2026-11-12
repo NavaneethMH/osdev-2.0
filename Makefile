@@ -12,7 +12,11 @@ CFLAGS := -m32 -std=c11 -ffreestanding -O2 -Wall -Wextra -Werror \
           -fno-stack-protector -fno-pic -fno-pie \
           -fno-asynchronous-unwind-tables -fno-unwind-tables
 
-.PHONY: all iso run clean disk-image
+ifeq ($(DEBUG),1)
+CFLAGS += -DHEAP_DEBUG
+endif
+
+.PHONY: all iso run debug debug-run clean disk-image
 
 all: iso
 
@@ -49,6 +53,13 @@ disk-image:
 	if [ ! -f "$(DISK_IMAGE)" ]; then truncate -s $(DISK_SIZE_MB)M "$(DISK_IMAGE)"; fi
 
 run: iso disk-image
+	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK_IMAGE),format=raw,if=ide,index=0,media=disk -m 128M
+
+debug:
+	$(MAKE) clean
+	$(MAKE) DEBUG=1 iso
+
+debug-run: debug disk-image
 	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK_IMAGE),format=raw,if=ide,index=0,media=disk -m 128M
 
 clean:
