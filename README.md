@@ -15,7 +15,7 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - 32-bit paging: identity-maps the first 32 MiB with 4 KiB pages; the page allocator only returns pages within that mapped region
 - Shell command `paging` reports whether paging is enabled
 - A bounded 64 KiB kernel heap with 16-byte-aligned `kmalloc`/`kfree`, block splitting/coalescing, and invalid-free checks
-- Shell commands `heapinfo` and `heapdemo` to inspect and exercise the kernel heap
+- Shell commands `heapinfo`, `heapcheck`, and `heapdemo` to inspect and exercise the kernel heap; debug builds track live allocations and count rejected invalid/double frees
 - Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
 - FAT-style free-space map and linked disk clusters, allowing files to share disk space and reclaim it after deletion or rewrite
 - Basic ATA/IDE primary-master PIO driver with bounded LBA-28 sector reads and writes
@@ -43,7 +43,7 @@ From the project folder:
 make run
 ```
 
-A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `heapinfo`, `heapdemo`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, `fsck`, and `clear`. `heapinfo` reports the heap's allocated/free payload and largest free block. `heapdemo` performs aligned allocations, checks that data remains intact, frees blocks in a mixed order, and checks that coalesced space can be reused. The heap is a bounded 64 KiB arena; allocation returns a 16-byte-aligned pointer or null on failure, and `kfree` rejects invalid or repeated frees. `alloc` reserves one 4 KiB physical page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The page allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports whether paging is enabled and the mapped limit. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption. `fsck` checks every directory entry, file chain, and saved data sector, and reports any unreferenced allocated clusters.
+A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `heapinfo`, `heapcheck`, `heapdemo`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, `fsck`, and `clear`. `heapinfo` reports the heap's allocated/free payload and largest free block. `heapcheck` verifies that heap metadata and the active-allocation count agree. `heapdemo` checks alignment, data integrity, splitting/coalescing, and rejection of invalid and repeated frees. The normal build rejects bad frees; a debug build additionally tracks live allocations and records each invalid or repeated free. Run `make debug-run` in Ubuntu to build and start that configuration. The heap is a bounded 64 KiB arena; allocation returns a 16-byte-aligned pointer or null on failure. `alloc` reserves one 4 KiB physical page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The page allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports whether paging is enabled and the mapped limit. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption. `fsck` checks every directory entry, file chain, and saved data sector, and reports any unreferenced allocated clusters.
 
 The keyboard uses a US QWERTY scan-code map. Either Shift key changes letters to uppercase and number-row/punctuation keys to their shifted symbols. Caps Lock toggles letter case; holding Shift while Caps Lock is on types lowercase letters. Caps Lock's keyboard LED is not controlled yet. At the TinyOS prompt, check it with `echo Hello`, `echo !@#`, then toggle Caps Lock and type `echo HELLO`; toggle it off afterward.
 
@@ -98,6 +98,7 @@ The ISO is written to `build/tinyos.iso`.
 17. (Complete) Add a persistent `rename` command for files and directories that preserves existing data clusters.
 18. (Complete) Add a persistent file-copy command that allocates an independent data chain.
 19. Add a bounded, aligned kernel heap with `kmalloc`/`kfree`. (Complete; verified in QEMU)
+20. Track heap allocations and diagnose invalid or repeated frees in debug builds. (Implemented; awaiting QEMU verification)
 
 ## License
 
