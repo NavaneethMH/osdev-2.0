@@ -314,3 +314,4 @@ const char *disk_error_string(int code)
         default: return "unknown disk error";
     }
 }
+
