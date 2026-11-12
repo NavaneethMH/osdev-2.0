@@ -18,8 +18,8 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - Shell command `pfdemo` safely demonstrates how page-fault error codes are decoded without causing a fault
 - A bounded 64 KiB kernel heap with 16-byte-aligned `kmalloc`/`kfree`, block splitting/coalescing, and invalid-free checks
 - Shell commands `heapinfo`, `heapcheck`, and `heapdemo` to inspect and exercise the kernel heap; debug builds track live allocations and count rejected invalid/double frees
-- Early task-system groundwork: task states, IDs, a CPU-context layout, a bootstrap-task snapshot, and reserved 4 KiB stack slots
-- Shell command `taskinfo` to inspect the bootstrap task and task-system setup
+- Cooperative task groundwork with task states, saved CPU contexts, per-task 4 KiB stacks, and a round-robin yield scheduler
+- Shell commands `taskinfo` and `taskdemo` to inspect task state and see two workers yield to each other; scheduling is cooperative, not timer-preemptive
 - Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
 - FAT-style free-space map and linked disk clusters, allowing files to share disk space and reclaim it after deletion or rewrite
 - Basic ATA/IDE primary-master PIO driver with bounded LBA-28 sector reads and writes
@@ -47,7 +47,7 @@ From the project folder:
 make run
 ```
 
-A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `taskinfo`, `meminfo`, `mmap`, `pages`, `paging`, `vminfo`, `vmtest`, `heapinfo`, `heapcheck`, `heapdemo`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, `fsck`, and `clear`. `heapinfo` reports the heap's allocated/free payload and largest free block. `heapcheck` verifies that heap metadata and the active-allocation count agree. `heapdemo` checks alignment, data integrity, splitting/coalescing, and rejection of invalid and repeated frees. The normal build rejects bad frees; a debug build additionally tracks live allocations and records each invalid or repeated free. Run `make debug-run` in Ubuntu to build and start that configuration. The heap is a bounded 64 KiB arena; allocation returns a 16-byte-aligned pointer or null on failure. `alloc` reserves one 4 KiB physical page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The page allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports the identity-mapped limit and dynamic mapping support. `vminfo` reports mapped pages and the bounded page-table pool. `vmtest` creates a temporary mapping outside the identity-mapped region, checks data through both virtual addresses, then removes the mapping and frees the page. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption. `fsck` checks every directory entry, file chain, and saved data sector, and reports any unreferenced allocated clusters.
+A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `taskinfo`, `taskdemo`, `meminfo`, `mmap`, `pages`, `paging`, `vminfo`, `vmtest`, `heapinfo`, `heapcheck`, `heapdemo`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, `fsck`, and `clear`. `heapinfo` reports the heap's allocated/free payload and largest free block. `heapcheck` verifies that heap metadata and the active-allocation count agree. `heapdemo` checks alignment, data integrity, splitting/coalescing, and rejection of invalid and repeated frees. The normal build rejects bad frees; a debug build additionally tracks live allocations and records each invalid or repeated free. Run `make debug-run` in Ubuntu to build and start that configuration. The heap is a bounded 64 KiB arena; allocation returns a 16-byte-aligned pointer or null on failure. `alloc` reserves one 4 KiB physical page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The page allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports the identity-mapped limit and dynamic mapping support. `vminfo` reports mapped pages and the bounded page-table pool. `vmtest` creates a temporary mapping outside the identity-mapped region, checks data through both virtual addresses, then removes the mapping and frees the page. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption. `fsck` checks every directory entry, file chain, and saved data sector, and reports any unreferenced allocated clusters.
 
 To verify virtual memory, run `paging`, `vminfo`, `vmtest`, then `vminfo` again. `vmtest` should pass; the final report should return to zero dynamic pages and zero dynamic page tables. The test maps one allocated physical page at virtual address 0x40000000, checks writes in both directions through the identity and dynamic addresses, then unmaps and releases it.
 
@@ -87,7 +87,7 @@ The ISO is written to `build/tinyos.iso`.
 
 ## Roadmap
 
-For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report one running bootstrap task (ID 0), the saved inspection snapshot, four task slots, and that switching is still disabled. This prepares the task data model; cooperative switching is the next milestone.
+For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report one running bootstrap task (ID 0), the saved inspection snapshot, four task slots, and that switching is still disabled. For Stage 2, Milestone 2, run `taskdemo`: Task A and Task B should alternate through steps 1–3 and return to the shell. Run `taskinfo` afterward; it should show one registered task and the number of cooperative switches. Switching is explicit-yield based; timer-driven preemption is not implemented yet.
 
 1. Boot and print a message. (Complete)
 2. Read keyboard input and run a small command loop. (Complete)
@@ -112,6 +112,7 @@ For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report 
 21. Map and unmap pages in a separate virtual-address range using a reusable page-table pool. (Complete; verified in QEMU)
 22. Decode page-fault error codes and report access, privilege, and fault details. (Complete; verified in QEMU)
 23. (Stage 2, Milestone 1) Define task states, saved-context layout, task IDs, and kernel-stack slots. (Complete; verified in QEMU)
+24. (Stage 2, Milestone 2) Add cooperative context switching and the two-worker `taskdemo`. (Complete; verified in QEMU)
 
 ## License
 
