@@ -146,6 +146,7 @@ static int page_allocator_available = 0;
 /* Timer state */
 static volatile unsigned int timer_ticks = 0; /* Incremented by IRQ0 */
 static volatile unsigned int timer_uptime_seconds = 0; /* Seconds since boot */
+static unsigned int timer_ticks_in_second = 0U;
 
 /* Keyboard state: ring buffer filled by the IRQ1 handler, drained by the shell. */
 static volatile char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
@@ -177,6 +178,7 @@ enum task_state {
     TASK_RUNNING,
     TASK_BLOCKED,
     TASK_EXITED
+
 };
 
 struct task_context {
@@ -200,6 +202,8 @@ struct task_control_block {
     /* Interrupt frames are used by the timer scheduler, separately from the
        cooperative context above. */
     unsigned int interrupt_esp;
+    /* Nonzero only while a task is blocked until a PIT tick deadline. */
+    volatile unsigned int wake_tick;
     void (*entry)(void);
     unsigned char kernel_stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
 };
@@ -215,6 +219,12 @@ static volatile unsigned int timer_preemption_count = 0U;
 static int task_model_ready = 0;
 static int task_switching_enabled = 0;
 static volatile int timer_preemption_enabled = 0;
+/* IRQ0 sets this; deadline scans happen later in task context. */
+static volatile int task_wakeup_pending = 0;
+
+static unsigned int save_and_disable_interrupts(void);
+static void restore_interrupts(unsigned int flags);
+static void process_sleep_wakeups(void);
 
 /* File metadata and contents are cached in RAM and backed by the QEMU disk. */
 struct file_entry {
@@ -349,6 +359,7 @@ static const char *task_state_name(enum task_state state)
     case TASK_BLOCKED: return "BLOCKED";
     case TASK_EXITED: return "EXITED";
     default: return "UNUSED";
+
     }
 }
 
@@ -370,6 +381,7 @@ static void initialize_task_model(void)
         tasks[i].context.eip = 0U;
         tasks[i].context.eflags = 0U;
         tasks[i].interrupt_esp = 0U;
+        tasks[i].wake_tick = 0U;
     }
 
     tasks[0].state = TASK_RUNNING;
@@ -397,6 +409,7 @@ static void initialize_task_model(void)
     task_count = 1U;
     current_task_id = 0U;
     task_switch_count = 0U;
+    task_wakeup_pending = 0;
     task_model_ready = 1;
 }
 
@@ -405,6 +418,13 @@ static void show_task_info(void)
     if (!task_model_ready) {
         put_string("Task model is not initialized.\n");
         return;
+    }
+
+    unsigned int blocked_count = 0U;
+    for (unsigned int i = 0U; i < MAX_TASKS; ++i) {
+        if (tasks[i].state == TASK_BLOCKED) {
+            ++blocked_count;
+        }
     }
 
     put_string("Task model: initialized\nRegistered tasks: ");
@@ -429,6 +449,9 @@ static void show_task_info(void)
     put_unsigned(TASK_STACK_SIZE);
     put_string(" bytes\nTask switching: ");
     put_string(task_switching_enabled ? "enabled\n" : "not enabled yet.\n");
+    put_string("Blocked tasks: ");
+    put_unsigned(blocked_count);
+    put_char('\n');
     put_string("Cooperative switches completed: ");
     put_unsigned(task_switch_count);
     put_string("\nTimer preemptions completed: ");
@@ -438,6 +461,7 @@ static void show_task_info(void)
 
 static void task_yield(void)
 {
+    process_sleep_wakeups();
     if (!task_switching_enabled || task_count < 2U) {
         return;
     }
@@ -468,9 +492,29 @@ static void task_yield(void)
     task_switch(&tasks[previous_id].context, &tasks[next_id].context);
 }
 
+/* Block the current task until a timer deadline. Deadlines are compared
+   modulo 32 bits; intervals must stay below half the counter range. */
+static void task_sleep_ticks(unsigned int ticks)
+{
+    if (ticks == 0U || ticks >= 0x80000000U ||
+        !task_switching_enabled || task_count < 2U) {
+        task_yield();
+        return;
+    }
+
+    unsigned int flags = save_and_disable_interrupts();
+    unsigned int id = current_task_id;
+    tasks[id].wake_tick = timer_ticks + ticks;
+    tasks[id].state = TASK_BLOCKED;
+    restore_interrupts(flags);
+    task_yield();
+}
+
 static void task_exit_current(void)
 {
+    unsigned int flags = save_and_disable_interrupts();
     tasks[current_task_id].state = TASK_EXITED;
+    restore_interrupts(flags);
     if (timer_preemption_enabled) {
         /* The IRQ scheduler will return to another task on the next tick. */
         for (;;) {
@@ -496,6 +540,7 @@ static void initialize_task_stack(unsigned int id, void (*entry)(void),
                                    const char *name)
 {
     struct task_control_block *task = &tasks[id];
+
     unsigned int *stack = (unsigned int *)
         ((unsigned int)&task->kernel_stack[TASK_STACK_SIZE]);
 
@@ -570,6 +615,71 @@ static void restore_interrupts(unsigned int flags)
     __asm__ volatile ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 }
 
+/* IRQ0 only records that time advanced. This short, bounded scan and the
+   task-state changes happen later in ordinary task context. */
+static void process_sleep_wakeups(void)
+{
+    unsigned int flags;
+    unsigned int now;
+
+    if (!task_wakeup_pending) {
+        return;
+    }
+
+    flags = save_and_disable_interrupts();
+    if (!task_wakeup_pending) {
+        restore_interrupts(flags);
+        return;
+    }
+    task_wakeup_pending = 0;
+    now = timer_ticks;
+    for (unsigned int i = 0U; i < MAX_TASKS; ++i) {
+        if (tasks[i].state == TASK_BLOCKED &&
+            (unsigned int)(now - tasks[i].wake_tick) < 0x80000000U) {
+            tasks[i].wake_tick = 0U;
+            tasks[i].state = TASK_READY;
+        }
+    }
+    restore_interrupts(flags);
+}
+
+/* Reclaim only an exited worker after execution has switched away from its
+   stack. Keep the stack storage reserved, but clear all reusable metadata. */
+static int task_reap(unsigned int id)
+{
+    unsigned int flags;
+    unsigned int *context_words;
+
+    if (id == 0U || id >= MAX_TASKS || id == current_task_id ||
+        tasks[id].state != TASK_EXITED) {
+        return 0;
+    }
+
+    flags = save_and_disable_interrupts();
+    if (tasks[id].state != TASK_EXITED) {
+        restore_interrupts(flags);
+        return 0;
+    }
+
+    tasks[id].state = TASK_UNUSED;
+    tasks[id].wake_tick = 0U;
+    tasks[id].interrupt_esp = 0U;
+    tasks[id].entry = 0;
+    context_words = (unsigned int *)&tasks[id].context;
+    for (unsigned int i = 0U;
+         i < sizeof(tasks[id].context) / sizeof(unsigned int); ++i) {
+        context_words[i] = 0U;
+    }
+    for (unsigned int i = 0U; i <= TASK_NAME_MAX; ++i) {
+        tasks[id].name[i] = '\0';
+    }
+    if (task_count > 1U) {
+        --task_count;
+    }
+    restore_interrupts(flags);
+    return 1;
+}
+
 static void task_preempt_worker_a(void)
 {
     for (unsigned int step = 1U; step <= 3U; ++step) {
@@ -611,6 +721,7 @@ static void run_preempt_demo(void)
 
     initialize_preempt_stack(1U, task_preempt_worker_a, "timer-a");
     initialize_preempt_stack(2U, task_preempt_worker_b, "timer-b");
+
     task_count = 3U;
     task_switching_enabled = 1;
     put_string("Timer preemption demo: two workers run without yielding.\n");
@@ -620,15 +731,8 @@ static void run_preempt_demo(void)
     }
 
     timer_preemption_enabled = 0;
-    tasks[1].state = TASK_UNUSED;
-    tasks[1].entry = 0;
-    tasks[1].interrupt_esp = 0U;
-    tasks[1].name[0] = '\0';
-    tasks[2].state = TASK_UNUSED;
-    tasks[2].entry = 0;
-    tasks[2].interrupt_esp = 0U;
-    tasks[2].name[0] = '\0';
-    task_count = 1U;
+    (void)task_reap(1U);
+    (void)task_reap(2U);
     put_string("Preemption demo complete; timer switched between both workers.\n");
 }
 
@@ -652,6 +756,51 @@ static void task_worker_b(void)
     }
 }
 
+static void task_sleep_worker_a(void)
+{
+    for (unsigned int i = 1U; i <= 3U; ++i) {
+        put_string("Sleep task A: working ");
+        put_unsigned(i);
+        put_char('\n');
+        task_sleep_ticks(5U);
+    }
+}
+
+static void task_sleep_worker_b(void)
+{
+    for (unsigned int i = 1U; i <= 3U; ++i) {
+        put_string("Sleep task B: working ");
+        put_unsigned(i);
+        put_char('\n');
+        task_sleep_ticks(8U);
+    }
+}
+
+static void run_sleep_demo(void)
+{
+    if (!task_model_ready || task_count != 1U ||
+        tasks[1].state != TASK_UNUSED || tasks[2].state != TASK_UNUSED) {
+        put_string("Sleep demo unavailable: tasks are already active.\n");
+        return;
+    }
+
+    initialize_task_stack(1U, task_sleep_worker_a, "sleep-a");
+    initialize_task_stack(2U, task_sleep_worker_b, "sleep-b");
+    task_count = 3U;
+    task_switching_enabled = 1;
+    put_string("Timed blocking demo: workers sleep for PIT ticks and wake up.\n");
+
+    while (tasks[1].state != TASK_EXITED || tasks[2].state != TASK_EXITED) {
+        task_yield();
+        /* Let the PIT advance while no worker is runnable. */
+        __asm__ volatile ("hlt");
+    }
+
+    (void)task_reap(1U);
+    (void)task_reap(2U);
+    put_string("Sleep demo complete; both workers woke and exited.\n");
+}
+
 static void run_task_demo(void)
 {
     if (!task_model_ready || task_count != 1U ||
@@ -670,13 +819,8 @@ static void run_task_demo(void)
         task_yield();
     }
 
-    tasks[1].state = TASK_UNUSED;
-    tasks[1].entry = 0;
-    tasks[1].name[0] = '\0';
-    tasks[2].state = TASK_UNUSED;
-    tasks[2].entry = 0;
-    tasks[2].name[0] = '\0';
-    task_count = 1U;
+    (void)task_reap(1U);
+    (void)task_reap(2U);
     put_string("Task demo complete; returned to the shell task.\n");
 }
 
@@ -758,6 +902,7 @@ static void initialize_page_allocator(void)
         unsigned int region_end = region->base_low + region->length_low;
         unsigned int start = region->base_low;
         if (start < kernel_end_address) {
+
             start = kernel_end_address;
         }
         if (start < 0x00100000U) {
@@ -939,6 +1084,7 @@ static int vm_unmap_page(unsigned int virtual_address)
         return 0;
     }
 
+
     table[table_index] = 0U;
     if (dynamic_mapped_pages > 0U) {
         --dynamic_mapped_pages;
@@ -1118,6 +1264,7 @@ static char key_from_scancode(unsigned char code, int shifted, int caps_lock)
         case 0x04: character = '3'; break; case 0x05: character = '4'; break;
         case 0x06: character = '5'; break; case 0x07: character = '6'; break;
         case 0x08: character = '7'; break; case 0x09: character = '8'; break;
+
         case 0x0A: character = '9'; break; case 0x0B: character = '0'; break;
         case 0x0C: character = '-'; break; case 0x0D: character = '='; break;
         case 0x0E: return '\b'; /* Backspace */
@@ -1297,6 +1444,7 @@ static int file_name_valid(const char *name)
     }
     return 1;
 }
+
 
 /* Copies a NUL-terminated string. Returns 0 if it does not fit in max. */
 static int copy_string(char *dest, unsigned int max, const char *src)
@@ -1478,6 +1626,7 @@ static int filesystem_write_data_chain(unsigned short first_cluster,
         }
         int result = disk_write_sectors(filesystem_cluster_lba(cluster), 1U,
                                         filesystem_fat_disk);
+
         if (result < 0) {
             return result;
         }
@@ -1658,6 +1807,7 @@ static int filesystem_save_change(unsigned int slot,
                 (void)filesystem_release_chain(first, count);
                 file_entry_copy(&files[slot], previous);
                 return result;
+
             }
             result = filesystem_write_fat();
             if (result < 0) {
@@ -1838,6 +1988,7 @@ static int initialize_file_store(void)
         for (unsigned int i = 0; i <= FILENAME_MAX_LEN; ++i) {
             name[i] = (char)directory[offset + i];
             if (name[i] == '\0') {
+
                 terminated = 1;
                 break;
             }
@@ -2018,6 +2169,7 @@ static int initialize_file_store(void)
         /* Reclaim clusters orphaned by an interrupted create, rewrite, or rm.
            All live chains were checked and marked while loading directory data. */
         int found_orphan = 0;
+
         for (unsigned int i = 0; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
             if (filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE &&
                 !filesystem_cluster_seen[i]) {
@@ -2197,6 +2349,7 @@ static void inspect_file_chain(unsigned int slot)
                 return;
             }
         }
+
 
         result = disk_read_sectors(filesystem_cluster_lba(cluster), 1U,
                                    filesystem_fat_disk);
@@ -2378,6 +2531,7 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
                 ++summary->directories;
             } else {
                 ++summary->files;
+
             }
             if (!filesystem_bounded_content_length(files[slot].content,
                                                    &lengths[slot])) {
@@ -2558,6 +2712,7 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
                 filesystem_audit_error(summary,
                                        "could not read a file data sector.");
                 put_string(disk_error_string(result));
+
                 put_char('\n');
                 content_offset = lengths[slot];
                 break;
@@ -2738,6 +2893,7 @@ static void set_irq_gates(unsigned short selector)
 
     static void (*const irq_stubs[16])(void) = {
         irq32, irq33, irq34, irq35, irq36, irq37, irq38, irq39,
+
         irq40, irq41, irq42, irq43, irq44, irq45, irq46, irq47
     };
 
@@ -2787,6 +2943,8 @@ static void initialize_timer(void)
 
     timer_ticks = 0;
     timer_uptime_seconds = 0;
+    timer_ticks_in_second = 0U;
+    task_wakeup_pending = 0;
 }
 
 /* The IRQ1 (keyboard) handler. Reads the scan code, translates it, and
@@ -2875,7 +3033,9 @@ unsigned int irq_handler(unsigned int irq_vector,
     switch (irq_vector) {
         case 32: /* IRQ0: PIT timer */
             timer_ticks++;
-            if ((timer_ticks % 100U) == 0U) {
+            task_wakeup_pending = 1;
+            if (++timer_ticks_in_second >= 100U) {
+                timer_ticks_in_second = 0U;
                 timer_uptime_seconds++;
             }
             /* Send EOI to the master PIC (IRQ0 is a master-PIC line). */
@@ -2914,6 +3074,7 @@ static void report_page_fault(unsigned int error_code, unsigned int address)
         put_string("Reason: non-present page (address is not mapped).\n");
     }
     put_string("Access: ");
+
     put_string((error_code & 0x02U) != 0U ? "write\n" : "read\n");
     put_string("Privilege: ");
     put_string((error_code & 0x04U) != 0U ? "user mode\n" : "supervisor mode\n");
@@ -3094,6 +3255,7 @@ static void run_heap_demo(void)
         middle[i] = (unsigned char)(i ^ 0x5AU);
     }
     for (unsigned int i = 0U; i < 40U; ++i) {
+
         last[i] = (unsigned char)(i + 1U);
     }
 
@@ -3236,7 +3398,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3248,6 +3410,8 @@ static void run_command(void)
         show_task_info();
     } else if (command_is("taskdemo")) {
         run_task_demo();
+    } else if (command_is("sleepdemo")) {
+        run_sleep_demo();
     } else if (command_is("preemptdemo")) {
         run_preempt_demo();
     } else if (command_is("uptime")) {
@@ -3272,6 +3436,7 @@ static void run_command(void)
         show_page_fault_demo();
     } else if (command_is("heapinfo")) {
         show_heap_info();
+
     } else if (command_is("heapcheck")) {
         show_heap_check();
     } else if (command_is("heapdemo")) {
@@ -3452,6 +3617,7 @@ static void run_command(void)
                                 put_string("Rename failed: ");
                                 put_string(file_store_error_message(result));
                                 put_char('\n');
+
                             } else {
                                 put_string("Renamed ");
                                 put_string(old_name);
@@ -3632,6 +3798,7 @@ static void run_command(void)
                 if (idx < 0) {
                     put_string("Directory not found: ");
                     put_string(name);
+
                     put_char('\n');
                 } else if (!files[idx].is_directory) {
                     put_string("Not a directory: ");
@@ -3812,6 +3979,7 @@ static void run_command(void)
         const char *name = command_args_after("cat ");
         if (!file_store_ready) {
             report_file_store_unavailable();
+
         } else if (name == 0) {
             put_string("Usage: cat <name>\n");
         } else if (!file_name_valid(name)) {
@@ -3969,3 +4137,4 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         }
     }
 }
+
