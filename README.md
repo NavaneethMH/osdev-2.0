@@ -98,7 +98,7 @@ The ISO is written to `build/tinyos.iso`.
 17. (Complete) Add a persistent `rename` command for files and directories that preserves existing data clusters.
 18. (Complete) Add a persistent file-copy command that allocates an independent data chain.
 19. Add a bounded, aligned kernel heap with `kmalloc`/`kfree`. (Complete; verified in QEMU)
-20. Track heap allocations and diagnose invalid or repeated frees in debug builds. (Implemented; awaiting QEMU verification)
+20. Track heap allocations and diagnose invalid or repeated frees in debug builds. (Complete; verified in QEMU)
 
 ## License
 
