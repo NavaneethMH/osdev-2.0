@@ -2480,6 +2480,40 @@ void irq_handler(unsigned int irq_vector)
     }
 }
 
+static void report_page_fault(unsigned int error_code, unsigned int address)
+{
+    put_string("Page fault address: 0x");
+    put_hex32(address);
+    put_char('\n');
+
+    if ((error_code & 0x01U) != 0U) {
+        put_string("Reason: protection violation (page is present, access denied).\n");
+    } else {
+        put_string("Reason: non-present page (address is not mapped).\n");
+    }
+    put_string("Access: ");
+    put_string((error_code & 0x02U) != 0U ? "write\n" : "read\n");
+    put_string("Privilege: ");
+    put_string((error_code & 0x04U) != 0U ? "user mode\n" : "supervisor mode\n");
+    if ((error_code & 0x08U) != 0U) {
+        put_string("Detail: reserved page-table bit was set.\n");
+    }
+    if ((error_code & 0x10U) != 0U) {
+        put_string("Operation: instruction fetch.\n");
+    } else {
+        put_string("Operation: data access.\n");
+    }
+}
+
+static void show_page_fault_demo(void)
+{
+    put_string("Simulated page-fault reports (no fault is triggered):\n");
+    put_string("Example 1: read from an unmapped address\n");
+    report_page_fault(0x00U, 0x08000000U);
+    put_string("Example 2: user-mode instruction fetch blocked by protection\n");
+    report_page_fault(0x15U, 0x00400000U);
+}
+
 void exception_handler(unsigned int vector, unsigned int error_code)
 {
     clear_screen();
@@ -2490,18 +2524,11 @@ void exception_handler(unsigned int vector, unsigned int error_code)
     put_hex32(error_code);
     put_string("\n");
 
-    /* Page fault (vector 14): report the faulting linear address from CR2. */
+    /* Page fault (vector 14): decode its error bits and CR2 address. */
     if (vector == 14U) {
         unsigned int cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        put_string("Page fault address: 0x");
-        put_hex32(cr2);
-        put_string("\n");
-        if ((error_code & 0x01U) != 0U) {
-            put_string("Cause: page not present (protection violation).\n");
-        } else {
-            put_string("Cause: page not present (not mapped).\n");
-        }
+        report_page_fault(error_code, cr2);
     }
 
     put_string("System halted.\n");
@@ -2787,7 +2814,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, meminfo, mmap, pages, paging, vminfo, vmtest, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -2813,6 +2840,8 @@ static void run_command(void)
         show_vm_info();
     } else if (command_is("vmtest")) {
         run_vm_test();
+    } else if (command_is("pfdemo")) {
+        show_page_fault_demo();
     } else if (command_is("heapinfo")) {
         show_heap_info();
     } else if (command_is("heapcheck")) {
