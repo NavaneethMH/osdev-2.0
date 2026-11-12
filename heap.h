@@ -7,6 +7,9 @@ struct kernel_heap_stats {
     unsigned int free;
     unsigned int largest_free;
     unsigned int allocations;
+    unsigned int invalid_frees;
+    unsigned int double_frees;
+    int debug_enabled;
 };
 
 /* Initialize the bounded kernel heap. Safe to call once during boot. */
