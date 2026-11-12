@@ -2417,6 +2417,30 @@ static void show_heap_info(void)
     put_unsigned(stats.largest_free);
     put_string(" bytes\nActive allocations: ");
     put_unsigned(stats.allocations);
+    if (stats.debug_enabled) {
+        put_string("\nHeap debug checks: enabled");
+    } else {
+        put_string("\nHeap debug checks: disabled (use debug build)");
+    }
+    put_char('\n');
+}
+
+static void show_heap_check(void)
+{
+    struct kernel_heap_stats stats;
+    if (!heap_get_stats(&stats)) {
+        put_string("Heap check failed: heap metadata is damaged or inconsistent.\n");
+        return;
+    }
+
+    put_string("Heap check passed: ");
+    put_unsigned(stats.allocations);
+    put_string(" active allocation(s).\nDebug checks: ");
+    put_string(stats.debug_enabled ? "enabled" : "disabled");
+    put_string("\nInvalid frees rejected: ");
+    put_unsigned(stats.invalid_frees);
+    put_string("\nDouble frees rejected: ");
+    put_unsigned(stats.double_frees);
     put_char('\n');
 }
 
@@ -2455,14 +2479,24 @@ static void run_heap_demo(void)
     int frees_ok = kfree(middle) && kfree(first) && kfree(last);
     unsigned char *coalesced = (unsigned char *)kmalloc(1024U);
     int coalesce_ok = coalesced != 0 && kfree(coalesced);
-    if (aligned && data_ok && frees_ok && coalesce_ok) {
-        put_string("Heap demo passed: alignment, data, free, and coalescing work.\n");
+    int invalid_free_ok = 0;
+    int double_free_ok = 0;
+    if (coalesce_ok) {
+        int stack_value = 0;
+        invalid_free_ok = !kfree(&stack_value);
+        double_free_ok = !kfree(coalesced);
+    }
+    if (aligned && data_ok && frees_ok && coalesce_ok &&
+        invalid_free_ok && double_free_ok) {
+        put_string("Heap demo passed: alignment, data, coalescing, and bad-free rejection work.\n");
     } else {
         put_string("Heap demo failed: ");
         if (!aligned) put_string("alignment ");
         if (!data_ok) put_string("data ");
         if (!frees_ok) put_string("free ");
         if (!coalesce_ok) put_string("coalescing/allocation ");
+        if (!invalid_free_ok) put_string("invalid-free rejection ");
+        if (!double_free_ok) put_string("double-free rejection ");
         put_char('\n');
     }
 }
@@ -2570,7 +2604,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, meminfo, mmap, pages, paging, heapinfo, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, meminfo, mmap, pages, paging, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -2594,6 +2628,8 @@ static void run_command(void)
         show_paging();
     } else if (command_is("heapinfo")) {
         show_heap_info();
+    } else if (command_is("heapcheck")) {
+        show_heap_check();
     } else if (command_is("heapdemo")) {
         run_heap_demo();
     } else if (command_is("diskinfo")) {
