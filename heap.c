@@ -6,6 +6,7 @@
 #define HEAP_MAGIC 0x48454150U
 #define HEAP_BLOCK_FREE 0U
 #define HEAP_BLOCK_USED 1U
+#define HEAP_DEBUG_MAX_ALLOCATIONS (KERNEL_HEAP_BYTES / (HEAP_HEADER_BYTES + HEAP_ALIGNMENT))
 
 struct heap_block {
     unsigned int total_size;
@@ -14,11 +15,119 @@ struct heap_block {
     unsigned int state;
 };
 
+static struct heap_block *block_at(unsigned int offset);
+
 static unsigned char heap_area[KERNEL_HEAP_BYTES]
     __attribute__((aligned(HEAP_ALIGNMENT)));
 static int heap_ready = 0;
 static int heap_corrupt = 0;
 static unsigned int heap_allocation_count = 0U;
+#ifdef HEAP_DEBUG
+struct heap_debug_record {
+    unsigned int address;
+    unsigned int active;
+};
+static struct heap_debug_record heap_debug_records[HEAP_DEBUG_MAX_ALLOCATIONS];
+static unsigned int heap_invalid_free_count = 0U;
+static unsigned int heap_double_free_count = 0U;
+
+enum {
+    HEAP_DEBUG_FREE_INVALID = 0,
+    HEAP_DEBUG_FREE_ACTIVE = 1,
+    HEAP_DEBUG_FREE_ALREADY_FREED = 2
+};
+
+static int heap_debug_register(void *pointer)
+{
+    unsigned int address = (unsigned int)pointer;
+    unsigned int reusable = HEAP_DEBUG_MAX_ALLOCATIONS;
+    for (unsigned int i = 0U; i < HEAP_DEBUG_MAX_ALLOCATIONS; ++i) {
+        if (heap_debug_records[i].address == address) {
+            if (heap_debug_records[i].active) {
+                return 0;
+            }
+            reusable = i;
+            break;
+        }
+        if (reusable == HEAP_DEBUG_MAX_ALLOCATIONS &&
+            heap_debug_records[i].address == 0U) {
+            reusable = i;
+        }
+    }
+    if (reusable == HEAP_DEBUG_MAX_ALLOCATIONS) {
+        for (unsigned int i = 0U; i < HEAP_DEBUG_MAX_ALLOCATIONS; ++i) {
+            if (!heap_debug_records[i].active) {
+                reusable = i;
+                break;
+            }
+        }
+    }
+    if (reusable == HEAP_DEBUG_MAX_ALLOCATIONS) {
+        return 0;
+    }
+    heap_debug_records[reusable].address = address;
+    heap_debug_records[reusable].active = 1U;
+    return 1;
+}
+
+static int heap_debug_release(void *pointer)
+{
+    unsigned int address = (unsigned int)pointer;
+    for (unsigned int i = 0U; i < HEAP_DEBUG_MAX_ALLOCATIONS; ++i) {
+        if (heap_debug_records[i].address == address) {
+            if (heap_debug_records[i].active) {
+                heap_debug_records[i].active = 0U;
+                return HEAP_DEBUG_FREE_ACTIVE;
+            }
+            ++heap_double_free_count;
+            return HEAP_DEBUG_FREE_ALREADY_FREED;
+        }
+    }
+    ++heap_invalid_free_count;
+    return HEAP_DEBUG_FREE_INVALID;
+}
+
+static void heap_debug_record_failed_free(void *pointer)
+{
+    if (pointer == 0) {
+        ++heap_invalid_free_count;
+        return;
+    }
+    (void)heap_debug_release(pointer);
+}
+
+static int heap_debug_validate(unsigned int used_blocks)
+{
+    unsigned int active = 0U;
+    for (unsigned int i = 0U; i < HEAP_DEBUG_MAX_ALLOCATIONS; ++i) {
+        if (!heap_debug_records[i].active) {
+            continue;
+        }
+        ++active;
+        unsigned int address = heap_debug_records[i].address;
+        unsigned int start = (unsigned int)&heap_area[0];
+        if (address < start + HEAP_HEADER_BYTES ||
+            address >= start + KERNEL_HEAP_BYTES) {
+            return 0;
+        }
+        unsigned int target = address - start - HEAP_HEADER_BYTES;
+        unsigned int offset = 0U;
+        int found = 0;
+        while (offset < KERNEL_HEAP_BYTES) {
+            struct heap_block *block = block_at(offset);
+            if (offset == target && block->state == HEAP_BLOCK_USED) {
+                found = 1;
+                break;
+            }
+            offset += block->total_size;
+        }
+        if (!found) {
+            return 0;
+        }
+    }
+    return active == used_blocks && active == heap_allocation_count;
+}
+#endif
 
 static unsigned int align_size(unsigned int size)
 {
@@ -42,6 +151,7 @@ static int heap_validate(void)
 
     unsigned int offset = 0U;
     unsigned int previous_size = 0U;
+    unsigned int used_blocks = 0U;
     while (offset < KERNEL_HEAP_BYTES) {
         struct heap_block *block = block_at(offset);
         if (block->magic != HEAP_MAGIC ||
@@ -53,6 +163,9 @@ static int heap_validate(void)
             heap_corrupt = 1;
             return 0;
         }
+        if (block->state == HEAP_BLOCK_USED) {
+            ++used_blocks;
+        }
         previous_size = block->total_size;
         offset += block->total_size;
     }
@@ -61,6 +174,17 @@ static int heap_validate(void)
         heap_corrupt = 1;
         return 0;
     }
+#ifdef HEAP_DEBUG
+    if (!heap_debug_validate(used_blocks)) {
+        heap_corrupt = 1;
+        return 0;
+    }
+#else
+    if (used_blocks != heap_allocation_count) {
+        heap_corrupt = 1;
+        return 0;
+    }
+#endif
     return 1;
 }
 
@@ -73,6 +197,14 @@ int heap_initialize(void)
     first->state = HEAP_BLOCK_FREE;
     heap_allocation_count = 0U;
     heap_corrupt = 0;
+#ifdef HEAP_DEBUG
+    for (unsigned int i = 0U; i < HEAP_DEBUG_MAX_ALLOCATIONS; ++i) {
+        heap_debug_records[i].address = 0U;
+        heap_debug_records[i].active = 0U;
+    }
+    heap_invalid_free_count = 0U;
+    heap_double_free_count = 0U;
+#endif
     heap_ready = 1;
     return 1;
 }
@@ -94,6 +226,12 @@ void *kmalloc(unsigned int size)
         struct heap_block *block = block_at(offset);
         unsigned int available = block->total_size - HEAP_HEADER_BYTES;
         if (block->state == HEAP_BLOCK_FREE && available >= payload_size) {
+            void *payload = (void *)(heap_area + offset + HEAP_HEADER_BYTES);
+#ifdef HEAP_DEBUG
+            if (!heap_debug_register(payload)) {
+                return 0;
+            }
+#endif
             unsigned int requested_total = HEAP_HEADER_BYTES + payload_size;
             unsigned int remainder = block->total_size - requested_total;
             if (remainder >= HEAP_HEADER_BYTES + HEAP_ALIGNMENT) {
@@ -111,7 +249,7 @@ void *kmalloc(unsigned int size)
             }
             block->state = HEAP_BLOCK_USED;
             ++heap_allocation_count;
-            return (void *)(heap_area + offset + HEAP_HEADER_BYTES);
+            return payload;
         }
         offset += block->total_size;
     }
@@ -120,7 +258,13 @@ void *kmalloc(unsigned int size)
 
 int kfree(void *pointer)
 {
-    if (pointer == 0 || !heap_validate()) {
+    if (pointer == 0) {
+#ifdef HEAP_DEBUG
+        heap_debug_record_failed_free(pointer);
+#endif
+        return 0;
+    }
+    if (!heap_validate()) {
         return 0;
     }
 
@@ -129,6 +273,9 @@ int kfree(void *pointer)
     if (address < start + HEAP_HEADER_BYTES ||
         address >= start + KERNEL_HEAP_BYTES ||
         ((address - start) & (HEAP_ALIGNMENT - 1U)) != 0U) {
+#ifdef HEAP_DEBUG
+        heap_debug_record_failed_free(pointer);
+#endif
         return 0;
     }
 
@@ -138,8 +285,16 @@ int kfree(void *pointer)
         struct heap_block *block = block_at(offset);
         if (offset == target_offset) {
             if (block->state != HEAP_BLOCK_USED) {
+#ifdef HEAP_DEBUG
+                heap_debug_record_failed_free(pointer);
+#endif
                 return 0;
             }
+#ifdef HEAP_DEBUG
+            if (heap_debug_release(pointer) != HEAP_DEBUG_FREE_ACTIVE) {
+                return 0;
+            }
+#endif
             block->state = HEAP_BLOCK_FREE;
             if (heap_allocation_count > 0U) {
                 --heap_allocation_count;
@@ -172,6 +327,9 @@ int kfree(void *pointer)
         }
         offset += block->total_size;
     }
+#ifdef HEAP_DEBUG
+    heap_debug_record_failed_free(pointer);
+#endif
     return 0;
 }
 
@@ -186,6 +344,15 @@ int heap_get_stats(struct kernel_heap_stats *stats)
     stats->free = 0U;
     stats->largest_free = 0U;
     stats->allocations = heap_allocation_count;
+#ifdef HEAP_DEBUG
+    stats->invalid_frees = heap_invalid_free_count;
+    stats->double_frees = heap_double_free_count;
+    stats->debug_enabled = 1;
+#else
+    stats->invalid_frees = 0U;
+    stats->double_frees = 0U;
+    stats->debug_enabled = 0;
+#endif
 
     unsigned int offset = 0U;
     while (offset < KERNEL_HEAP_BYTES) {
