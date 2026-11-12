@@ -25,14 +25,17 @@ $(BUILD_DIR)/boot.o: boot.asm | $(BUILD_DIR)
 $(BUILD_DIR)/interrupts.o: interrupts.asm | $(BUILD_DIR)
 	$(AS) -f elf32 $< -o $@
 
-$(BUILD_DIR)/kernel.o: kernel.c disk.h | $(BUILD_DIR)
+$(BUILD_DIR)/kernel.o: kernel.c disk.h heap.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/disk.o: disk.c disk.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o linker.ld
-	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o
+$(BUILD_DIR)/heap.o: heap.c heap.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o linker.ld
+	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o
 	grub-file --is-x86-multiboot $@
 
 iso: $(KERNEL) grub.cfg
