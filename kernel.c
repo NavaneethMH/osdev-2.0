@@ -15,6 +15,9 @@
 #define PAGING_MAPPED_LIMIT 0x02000000U /* First 32 MiB identity-mapped. */
 #define VM_DYNAMIC_TABLES 8U
 #define VM_TEST_VIRTUAL_ADDRESS 0x40000000U
+#define MAX_TASKS 4U
+#define TASK_STACK_SIZE 4096U
+#define TASK_NAME_MAX 15U
 #define MAX_FILES 16U
 #define FILENAME_MAX_LEN 15U
 #define FILE_CONTENT_MAX 32768U
@@ -117,8 +120,6 @@ DECLARE_IRQ(44);  DECLARE_IRQ(45);  DECLARE_IRQ(46);  DECLARE_IRQ(47);
 #undef DECLARE_IRQ
 
 extern void idt_load(const struct idt_pointer *pointer);
-extern void task_switch(struct task_context *old_context,
-                        const struct task_context *new_context);
 
 static volatile unsigned short *const video = (volatile unsigned short *)0xB8000;
 static unsigned int cursor = 0;
@@ -168,7 +169,8 @@ static int dynamic_page_table_used[VM_DYNAMIC_TABLES];
 static unsigned int dynamic_mapped_pages = 0U;
 static int paging_enabled = 0;
 
-/* Stage 2 task records. The bootstrap task continues on GRUB's stack. */
+/* Stage 2 task model. The bootstrap task continues on GRUB's stack while
+   worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
 enum task_state {
     TASK_UNUSED = 0,
     TASK_READY,
@@ -192,19 +194,27 @@ struct task_context {
 
 struct task_control_block {
     unsigned int id;
-    enum task_state state;
+    volatile enum task_state state;
     char name[TASK_NAME_MAX + 1U];
     struct task_context context;
+    /* Interrupt frames are used by the timer scheduler, separately from the
+       cooperative context above. */
+    unsigned int interrupt_esp;
     void (*entry)(void);
     unsigned char kernel_stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
 };
 
+extern void task_switch(struct task_context *old_context,
+                        const struct task_context *new_context);
+
 static struct task_control_block tasks[MAX_TASKS];
-static unsigned int current_task_id = 0U;
+static volatile unsigned int current_task_id = 0U;
 static unsigned int task_count = 0U;
 static unsigned int task_switch_count = 0U;
+static volatile unsigned int timer_preemption_count = 0U;
 static int task_model_ready = 0;
 static int task_switching_enabled = 0;
+static volatile int timer_preemption_enabled = 0;
 
 /* File metadata and contents are cached in RAM and backed by the QEMU disk. */
 struct file_entry {
@@ -359,6 +369,7 @@ static void initialize_task_model(void)
         tasks[i].context.eax = 0U;
         tasks[i].context.eip = 0U;
         tasks[i].context.eflags = 0U;
+        tasks[i].interrupt_esp = 0U;
     }
 
     tasks[0].state = TASK_RUNNING;
@@ -370,8 +381,7 @@ static void initialize_task_model(void)
     tasks[0].name[5] = 'l';
     tasks[0].name[6] = '\0';
 
-    /* This snapshot describes the bootstrap task until its first yield saves
-       a resumable switch frame. */
+    /* Bootstrap task context is captured when the scheduler is initialized. */
     __asm__ volatile (
         "movl %%esp, %0\n\t"
         "pushfl\n\t"
@@ -421,9 +431,10 @@ static void show_task_info(void)
     put_string(task_switching_enabled ? "enabled\n" : "not enabled yet.\n");
     put_string("Cooperative switches completed: ");
     put_unsigned(task_switch_count);
+    put_string("\nTimer preemptions completed: ");
+    put_unsigned(timer_preemption_count);
     put_char('\n');
 }
-
 
 static void task_yield(void)
 {
@@ -460,6 +471,12 @@ static void task_yield(void)
 static void task_exit_current(void)
 {
     tasks[current_task_id].state = TASK_EXITED;
+    if (timer_preemption_enabled) {
+        /* The IRQ scheduler will return to another task on the next tick. */
+        for (;;) {
+            __asm__ volatile ("hlt");
+        }
+    }
     task_yield();
     for (;;) {
         __asm__ volatile ("cli; hlt");
@@ -482,8 +499,8 @@ static void initialize_task_stack(unsigned int id, void (*entry)(void),
     unsigned int *stack = (unsigned int *)
         ((unsigned int)&task->kernel_stack[TASK_STACK_SIZE]);
 
-    /* task_switch restores four registers, then returns into the bootstrap.
-       The final word catches an unexpected return from the bootstrap. */
+    /* Build the stack frame expected by task_switch's four register pops
+       and ret. The extra return address safely catches an unexpected return. */
     *--stack = (unsigned int)task_exit_current;
     *--stack = (unsigned int)task_bootstrap;
     *--stack = 0U; /* EBP */
@@ -501,6 +518,118 @@ static void initialize_task_stack(unsigned int id, void (*entry)(void),
         }
     }
     task->state = TASK_READY;
+}
+
+static void initialize_preempt_stack(unsigned int id, void (*entry)(void),
+                                     const char *name)
+{
+    struct task_control_block *task = &tasks[id];
+    unsigned short code_selector;
+    unsigned int *stack = (unsigned int *)
+        ((unsigned int)&task->kernel_stack[TASK_STACK_SIZE]);
+
+    /* GRUB supplies the active GDT selectors; use the same code selector
+       installed in our IDT instead of assuming it is always 0x08. */
+    __asm__ volatile ("mov %%cs, %0" : "=r" (code_selector));
+
+    /* irq_common restores this exact pusha + vector/error + iret layout. */
+    *--stack = (unsigned int)task_exit_current; /* C return address after iret */
+    *--stack = 0x202U;                         /* EFLAGS: interrupts enabled */
+    *--stack = (unsigned int)code_selector;    /* Current kernel code segment */
+    *--stack = (unsigned int)task_bootstrap;    /* EIP */
+    *--stack = 0U;                             /* Error code */
+    *--stack = 32U;                            /* IRQ vector */
+    *--stack = 0U;                             /* EAX */
+    *--stack = 0U;                             /* ECX */
+    *--stack = 0U;                             /* EDX */
+    *--stack = 0U;                             /* EBX */
+    *--stack = 0U;                             /* Original ESP (ignored by popa) */
+    *--stack = 0U;                             /* EBP */
+    *--stack = 0U;                             /* ESI */
+    *--stack = 0U;                             /* EDI */
+    task->interrupt_esp = (unsigned int)stack;
+    task->entry = entry;
+    for (unsigned int i = 0U; i <= TASK_NAME_MAX; ++i) {
+        task->name[i] = name[i];
+        if (name[i] == '\0') {
+            break;
+        }
+    }
+    task->state = TASK_READY;
+}
+
+static unsigned int save_and_disable_interrupts(void)
+{
+    unsigned int flags;
+    __asm__ volatile ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+    return flags;
+}
+
+static void restore_interrupts(unsigned int flags)
+{
+    __asm__ volatile ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+}
+
+static void task_preempt_worker_a(void)
+{
+    for (unsigned int step = 1U; step <= 3U; ++step) {
+        unsigned int start = timer_ticks;
+        while ((unsigned int)(timer_ticks - start) < 4U) {
+            __asm__ volatile ("pause");
+        }
+        unsigned int flags = save_and_disable_interrupts();
+        put_string("Timer task A: slice ");
+        put_unsigned(step);
+        put_char('\n');
+        restore_interrupts(flags);
+    }
+}
+
+static void task_preempt_worker_b(void)
+{
+    for (unsigned int step = 1U; step <= 3U; ++step) {
+        unsigned int start = timer_ticks;
+        while ((unsigned int)(timer_ticks - start) < 4U) {
+            __asm__ volatile ("pause");
+        }
+        unsigned int flags = save_and_disable_interrupts();
+        put_string("Timer task B: slice ");
+        put_unsigned(step);
+        put_char('\n');
+        restore_interrupts(flags);
+    }
+}
+
+static void run_preempt_demo(void)
+{
+    if (!task_model_ready || task_count != 1U ||
+        tasks[1].state != TASK_UNUSED || tasks[2].state != TASK_UNUSED ||
+        timer_preemption_enabled) {
+        put_string("Preemption demo unavailable: tasks are already active.\n");
+        return;
+    }
+
+    initialize_preempt_stack(1U, task_preempt_worker_a, "timer-a");
+    initialize_preempt_stack(2U, task_preempt_worker_b, "timer-b");
+    task_count = 3U;
+    task_switching_enabled = 1;
+    put_string("Timer preemption demo: two workers run without yielding.\n");
+    timer_preemption_enabled = 1;
+    while (tasks[1].state != TASK_EXITED || tasks[2].state != TASK_EXITED) {
+        __asm__ volatile ("pause");
+    }
+
+    timer_preemption_enabled = 0;
+    tasks[1].state = TASK_UNUSED;
+    tasks[1].entry = 0;
+    tasks[1].interrupt_esp = 0U;
+    tasks[1].name[0] = '\0';
+    tasks[2].state = TASK_UNUSED;
+    tasks[2].entry = 0;
+    tasks[2].interrupt_esp = 0U;
+    tasks[2].name[0] = '\0';
+    task_count = 1U;
+    put_string("Preemption demo complete; timer switched between both workers.\n");
 }
 
 static void task_worker_a(void)
@@ -2710,10 +2839,39 @@ static void keyboard_irq_handler(void)
     ++keyboard_count;
 }
 
-/* Central dispatch for hardware interrupts 32-47, called by irq_common in
-   interrupts.asm. IRQ number passed is the vector (32-47). */
-void irq_handler(unsigned int irq_vector)
+/* Save this IRQ frame and select a READY task. Returning a different frame
+   makes irq_common resume that task through popa/iret. */
+static unsigned int schedule_from_timer(unsigned int saved_stack_pointer)
 {
+    unsigned int previous_id = current_task_id;
+    tasks[previous_id].interrupt_esp = saved_stack_pointer;
+    if (tasks[previous_id].state == TASK_RUNNING) {
+        tasks[previous_id].state = TASK_READY;
+    }
+
+    unsigned int next_id = previous_id;
+    for (unsigned int offset = 1U; offset <= MAX_TASKS; ++offset) {
+        unsigned int candidate = (previous_id + offset) % MAX_TASKS;
+        if (tasks[candidate].state == TASK_READY) {
+            next_id = candidate;
+            break;
+        }
+    }
+
+    tasks[next_id].state = TASK_RUNNING;
+    current_task_id = next_id;
+    if (next_id != previous_id) {
+        ++timer_preemption_count;
+    }
+    return tasks[next_id].interrupt_esp;
+}
+
+/* Central dispatch for hardware interrupts 32-47, called by irq_common in
+   interrupts.asm. Return the stack frame that irq_common should restore. */
+unsigned int irq_handler(unsigned int irq_vector,
+                         unsigned int saved_stack_pointer)
+{
+    unsigned int return_stack = saved_stack_pointer;
     switch (irq_vector) {
         case 32: /* IRQ0: PIT timer */
             timer_ticks++;
@@ -2722,6 +2880,9 @@ void irq_handler(unsigned int irq_vector)
             }
             /* Send EOI to the master PIC (IRQ0 is a master-PIC line). */
             outb(0x20, 0x20);
+            if (timer_preemption_enabled && task_model_ready && task_count > 1U) {
+                return_stack = schedule_from_timer(saved_stack_pointer);
+            }
             break;
 
         case 33: /* IRQ1: PS/2 keyboard */
@@ -2738,6 +2899,7 @@ void irq_handler(unsigned int irq_vector)
             outb(0x20, 0x20);     /* EOI to master PIC */
             break;
     }
+    return return_stack;
 }
 
 static void report_page_fault(unsigned int error_code, unsigned int address)
@@ -3074,7 +3236,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3086,6 +3248,8 @@ static void run_command(void)
         show_task_info();
     } else if (command_is("taskdemo")) {
         run_task_demo();
+    } else if (command_is("preemptdemo")) {
+        run_preempt_demo();
     } else if (command_is("uptime")) {
         put_string("Uptime: ");
         put_unsigned(timer_uptime_seconds);
@@ -3805,4 +3969,3 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         }
     }
 }
-
