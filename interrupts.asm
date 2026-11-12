@@ -112,3 +112,20 @@ idt_load:
     mov eax, [esp + 4]
     lidt [eax]
     ret
+
+; Save callee-saved registers and the current stack, then restore another task.
+global task_switch
+task_switch:
+    push ebp
+    push ebx
+    push esi
+    push edi
+    mov eax, [esp + 20]       ; old_context argument
+    mov [eax + 12], esp       ; struct task_context.esp
+    mov ecx, [esp + 24]       ; new_context argument
+    mov esp, [ecx + 12]
+    pop edi
+    pop esi
+    pop ebx
+    pop ebp
+    ret
