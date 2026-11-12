@@ -11,10 +11,11 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - Tiny shell commands for system information, memory, and files, including `mkdir`, `cd`, `pwd`, and `rmdir`
 - Copies GRUB's memory map before using it
 - A simple physical page allocator for usable memory below 4 GiB, starting after the kernel
-- CPU exception handlers with a readable panic screen
+- CPU exception handlers with a readable panic screen; page faults report the address, access type, privilege level, and fault reason
 - 32-bit paging: identity-maps the first 32 MiB, with a reusable page-table pool for temporary virtual mappings beyond that range
 - Shell commands `paging` and `vminfo` report paging state, dynamic mappings, and page-table pool use
 - Shell command `vmtest` maps a physical page at a separate virtual address, verifies reads and writes through both aliases, then unmaps and frees it
+- Shell command `pfdemo` safely demonstrates how page-fault error codes are decoded without causing a fault
 - A bounded 64 KiB kernel heap with 16-byte-aligned `kmalloc`/`kfree`, block splitting/coalescing, and invalid-free checks
 - Shell commands `heapinfo`, `heapcheck`, and `heapdemo` to inspect and exercise the kernel heap; debug builds track live allocations and count rejected invalid/double frees
 - Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
@@ -47,6 +48,8 @@ make run
 A QEMU window should open with the `tinyos>` prompt. Try `help`, `about`, `meminfo`, `mmap`, `pages`, `paging`, `vminfo`, `vmtest`, `heapinfo`, `heapcheck`, `heapdemo`, `alloc`, `echo hello`, `uptime`, `diskinfo`, `disktest`, `df`, `fscheck <file>`, `fsck`, and `clear`. `heapinfo` reports the heap's allocated/free payload and largest free block. `heapcheck` verifies that heap metadata and the active-allocation count agree. `heapdemo` checks alignment, data integrity, splitting/coalescing, and rejection of invalid and repeated frees. The normal build rejects bad frees; a debug build additionally tracks live allocations and records each invalid or repeated free. Run `make debug-run` in Ubuntu to build and start that configuration. The heap is a bounded 64 KiB arena; allocation returns a 16-byte-aligned pointer or null on failure. `alloc` reserves one 4 KiB physical page and prints its hexadecimal address. Use `free` to return the most recently allocated page, or `free <address>` to return a specific page allocated during this boot. The page allocator tracks up to 256 active pages, all within the first 32 MiB that paging maps. `uptime` shows how many seconds have elapsed since the kernel started, driven by the PIT timer on IRQ0. `paging` reports the identity-mapped limit and dynamic mapping support. `vminfo` reports mapped pages and the bounded page-table pool. `vmtest` creates a temporary mapping outside the identity-mapped region, checks data through both virtual addresses, then removes the mapping and frees the page. `df` reports total, used, and free filesystem data clusters. `fscheck <file>` prints that file's cluster chain and checks its directory entry, allocation map, data sectors, and allocation ownership for corruption. `fsck` checks every directory entry, file chain, and saved data sector, and reports any unreferenced allocated clusters.
 
 To verify virtual memory, run `paging`, `vminfo`, `vmtest`, then `vminfo` again. `vmtest` should pass; the final report should return to zero dynamic pages and zero dynamic page tables. The test maps one allocated physical page at virtual address 0x40000000, checks writes in both directions through the identity and dynamic addresses, then unmaps and releases it.
+
+To check page-fault decoding without halting TinyOS, run `pfdemo`. It prints two simulated reports: a supervisor read from an unmapped address, and a user instruction fetch rejected by a protection rule. A real page fault uses the same report function and includes the CPU-reported fault address from CR2. The demo does not intentionally trigger a fault.
 
 The keyboard uses a US QWERTY scan-code map. Either Shift key changes letters to uppercase and number-row/punctuation keys to their shifted symbols. Caps Lock toggles letter case; holding Shift while Caps Lock is on types lowercase letters. Caps Lock's keyboard LED is not controlled yet. At the TinyOS prompt, check it with `echo Hello`, `echo !@#`, then toggle Caps Lock and type `echo HELLO`; toggle it off afterward.
 
@@ -103,6 +106,7 @@ The ISO is written to `build/tinyos.iso`.
 19. Add a bounded, aligned kernel heap with `kmalloc`/`kfree`. (Complete; verified in QEMU)
 20. Track heap allocations and diagnose invalid or repeated frees in debug builds. (Complete; verified in QEMU)
 21. Map and unmap pages in a separate virtual-address range using a reusable page-table pool. (Complete; verified in QEMU)
+22. Decode page-fault error codes and report access, privilege, and fault details. (Complete; verified in QEMU)
 
 ## License
 
