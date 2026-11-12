@@ -117,6 +117,8 @@ DECLARE_IRQ(44);  DECLARE_IRQ(45);  DECLARE_IRQ(46);  DECLARE_IRQ(47);
 #undef DECLARE_IRQ
 
 extern void idt_load(const struct idt_pointer *pointer);
+extern void task_switch(struct task_context *old_context,
+                        const struct task_context *new_context);
 
 static volatile unsigned short *const video = (volatile unsigned short *)0xB8000;
 static unsigned int cursor = 0;
@@ -166,8 +168,7 @@ static int dynamic_page_table_used[VM_DYNAMIC_TABLES];
 static unsigned int dynamic_mapped_pages = 0U;
 static int paging_enabled = 0;
 
-/* Stage 2 groundwork: define task records and reserve stacks, but do not
-   switch execution yet. The bootstrap task continues on GRUB's stack. */
+/* Stage 2 task records. The bootstrap task continues on GRUB's stack. */
 enum task_state {
     TASK_UNUSED = 0,
     TASK_READY,
@@ -369,8 +370,8 @@ static void initialize_task_model(void)
     tasks[0].name[5] = 'l';
     tasks[0].name[6] = '\0';
 
-    /* This is an inspection snapshot, not a resumable interrupt frame.
-       The next milestone will define the real cooperative switch frame. */
+    /* This snapshot describes the bootstrap task until its first yield saves
+       a resumable switch frame. */
     __asm__ volatile (
         "movl %%esp, %0\n\t"
         "pushfl\n\t"
@@ -414,7 +415,7 @@ static void show_task_info(void)
     put_hex32(tasks[0].context.eflags);
     put_string("\nTask slots: ");
     put_unsigned(MAX_TASKS);
-    put_string("; reserved stack size per future task: ");
+    put_string("; stack size per task: ");
     put_unsigned(TASK_STACK_SIZE);
     put_string(" bytes\nTask switching: ");
     put_string(task_switching_enabled ? "enabled\n" : "not enabled yet.\n");
