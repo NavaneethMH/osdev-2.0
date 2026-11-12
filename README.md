@@ -114,7 +114,7 @@ For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report 
 21. Map and unmap pages in a separate virtual-address range using a reusable page-table pool. (Complete; verified in QEMU)
 22. Decode page-fault error codes and report access, privilege, and fault details. (Complete; verified in QEMU)
 23. (Stage 2, Milestone 1) Define task states, saved-context layout, task IDs, and kernel-stack slots. (Complete; verified in QEMU)
-24. (Stage 2, Milestone 3 — Implemented; needs QEMU verification) Save and restore task interrupt frames so PIT IRQ0 can preempt workers in `preemptdemo` without explicit yields.
+24. (Stage 2, Milestone 3 — Complete; verified in QEMU) Save and restore task interrupt frames so PIT IRQ0 can preempt workers in `preemptdemo` without explicit yields.
 
 ## License
 
