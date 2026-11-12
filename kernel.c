@@ -194,13 +194,16 @@ struct task_control_block {
     enum task_state state;
     char name[TASK_NAME_MAX + 1U];
     struct task_context context;
+    void (*entry)(void);
     unsigned char kernel_stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
 };
 
 static struct task_control_block tasks[MAX_TASKS];
 static unsigned int current_task_id = 0U;
 static unsigned int task_count = 0U;
+static unsigned int task_switch_count = 0U;
 static int task_model_ready = 0;
+static int task_switching_enabled = 0;
 
 /* File metadata and contents are cached in RAM and backed by the QEMU disk. */
 struct file_entry {
@@ -344,6 +347,7 @@ static void initialize_task_model(void)
         tasks[i].id = i;
         tasks[i].state = TASK_UNUSED;
         tasks[i].name[0] = '\0';
+        tasks[i].entry = 0;
         tasks[i].context.edi = 0U;
         tasks[i].context.esi = 0U;
         tasks[i].context.ebp = 0U;
@@ -381,6 +385,7 @@ static void initialize_task_model(void)
 
     task_count = 1U;
     current_task_id = 0U;
+    task_switch_count = 0U;
     task_model_ready = 1;
 }
 
@@ -411,7 +416,138 @@ static void show_task_info(void)
     put_unsigned(MAX_TASKS);
     put_string("; reserved stack size per future task: ");
     put_unsigned(TASK_STACK_SIZE);
-    put_string(" bytes\nTask switching: not enabled yet.\n");
+    put_string(" bytes\nTask switching: ");
+    put_string(task_switching_enabled ? "enabled\n" : "not enabled yet.\n");
+    put_string("Cooperative switches completed: ");
+    put_unsigned(task_switch_count);
+    put_char('\n');
+}
+
+
+static void task_yield(void)
+{
+    if (!task_switching_enabled || task_count < 2U) {
+        return;
+    }
+
+    unsigned int previous_id = current_task_id;
+    unsigned int next_id = previous_id;
+    for (unsigned int offset = 1U; offset <= MAX_TASKS; ++offset) {
+        unsigned int candidate = (previous_id + offset) % MAX_TASKS;
+        if (tasks[candidate].state == TASK_READY) {
+            next_id = candidate;
+            break;
+        }
+    }
+
+    if (next_id == previous_id) {
+        if (tasks[previous_id].state == TASK_READY) {
+            tasks[previous_id].state = TASK_RUNNING;
+        }
+        return;
+    }
+
+    if (tasks[previous_id].state == TASK_RUNNING) {
+        tasks[previous_id].state = TASK_READY;
+    }
+    tasks[next_id].state = TASK_RUNNING;
+    current_task_id = next_id;
+    ++task_switch_count;
+    task_switch(&tasks[previous_id].context, &tasks[next_id].context);
+}
+
+static void task_exit_current(void)
+{
+    tasks[current_task_id].state = TASK_EXITED;
+    task_yield();
+    for (;;) {
+        __asm__ volatile ("cli; hlt");
+    }
+}
+
+static void task_bootstrap(void)
+{
+    unsigned int id = current_task_id;
+    if (id < MAX_TASKS && tasks[id].entry != 0) {
+        tasks[id].entry();
+    }
+    task_exit_current();
+}
+
+static void initialize_task_stack(unsigned int id, void (*entry)(void),
+                                   const char *name)
+{
+    struct task_control_block *task = &tasks[id];
+    unsigned int *stack = (unsigned int *)
+        ((unsigned int)&task->kernel_stack[TASK_STACK_SIZE]);
+
+    /* task_switch restores four registers, then returns into the bootstrap.
+       The final word catches an unexpected return from the bootstrap. */
+    *--stack = (unsigned int)task_exit_current;
+    *--stack = (unsigned int)task_bootstrap;
+    *--stack = 0U; /* EBP */
+    *--stack = 0U; /* EBX */
+    *--stack = 0U; /* ESI */
+    *--stack = 0U; /* EDI */
+    task->context.esp = (unsigned int)stack;
+    task->context.eip = (unsigned int)task_bootstrap;
+    task->context.eflags = 0x202U;
+    task->entry = entry;
+    for (unsigned int i = 0U; i <= TASK_NAME_MAX; ++i) {
+        task->name[i] = name[i];
+        if (name[i] == '\0') {
+            break;
+        }
+    }
+    task->state = TASK_READY;
+}
+
+static void task_worker_a(void)
+{
+    for (unsigned int i = 1U; i <= 3U; ++i) {
+        put_string("Task A: step ");
+        put_unsigned(i);
+        put_char('\n');
+        task_yield();
+    }
+}
+
+static void task_worker_b(void)
+{
+    for (unsigned int i = 1U; i <= 3U; ++i) {
+        put_string("Task B: step ");
+        put_unsigned(i);
+        put_char('\n');
+        task_yield();
+    }
+}
+
+static void run_task_demo(void)
+{
+    if (!task_model_ready || task_count != 1U ||
+        tasks[1].state != TASK_UNUSED || tasks[2].state != TASK_UNUSED) {
+        put_string("Task demo unavailable: tasks are already active.\n");
+        return;
+    }
+
+    initialize_task_stack(1U, task_worker_a, "worker-a");
+    initialize_task_stack(2U, task_worker_b, "worker-b");
+    task_count = 3U;
+    task_switching_enabled = 1;
+
+    put_string("Cooperative task demo: A and B yield three times each.\n");
+    while (tasks[1].state != TASK_EXITED || tasks[2].state != TASK_EXITED) {
+        task_yield();
+    }
+
+    tasks[1].state = TASK_UNUSED;
+    tasks[1].entry = 0;
+    tasks[1].name[0] = '\0';
+    tasks[2].state = TASK_UNUSED;
+    tasks[2].entry = 0;
+    tasks[2].name[0] = '\0';
+    task_count = 1U;
+    put_string("Task demo complete; returned to the shell task.\n");
 }
 
 static void put_hex64(unsigned int high, unsigned int low)
@@ -2937,7 +3073,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -2947,6 +3083,8 @@ static void run_command(void)
         put_string("Type a command and press Enter.\n");
     } else if (command_is("taskinfo")) {
         show_task_info();
+    } else if (command_is("taskdemo")) {
+        run_task_demo();
     } else if (command_is("uptime")) {
         put_string("Uptime: ");
         put_unsigned(timer_uptime_seconds);
