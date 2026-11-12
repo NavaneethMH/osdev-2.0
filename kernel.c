@@ -166,6 +166,42 @@ static int dynamic_page_table_used[VM_DYNAMIC_TABLES];
 static unsigned int dynamic_mapped_pages = 0U;
 static int paging_enabled = 0;
 
+/* Stage 2 groundwork: define task records and reserve stacks, but do not
+   switch execution yet. The bootstrap task continues on GRUB's stack. */
+enum task_state {
+    TASK_UNUSED = 0,
+    TASK_READY,
+    TASK_RUNNING,
+    TASK_BLOCKED,
+    TASK_EXITED
+};
+
+struct task_context {
+    unsigned int edi;
+    unsigned int esi;
+    unsigned int ebp;
+    unsigned int esp;
+    unsigned int ebx;
+    unsigned int edx;
+    unsigned int ecx;
+    unsigned int eax;
+    unsigned int eip;
+    unsigned int eflags;
+};
+
+struct task_control_block {
+    unsigned int id;
+    enum task_state state;
+    char name[TASK_NAME_MAX + 1U];
+    struct task_context context;
+    unsigned char kernel_stack[TASK_STACK_SIZE] __attribute__((aligned(16)));
+};
+
+static struct task_control_block tasks[MAX_TASKS];
+static unsigned int current_task_id = 0U;
+static unsigned int task_count = 0U;
+static int task_model_ready = 0;
+
 /* File metadata and contents are cached in RAM and backed by the QEMU disk. */
 struct file_entry {
     char name[FILENAME_MAX_LEN + 1U]; /* NUL-terminated. */
@@ -289,6 +325,93 @@ static void put_hex32(unsigned int value)
     for (int shift = 28; shift >= 0; shift -= 4) {
         put_char(hex[(value >> (unsigned int)shift) & 0x0FU]);
     }
+}
+
+static const char *task_state_name(enum task_state state)
+{
+    switch (state) {
+    case TASK_READY: return "READY";
+    case TASK_RUNNING: return "RUNNING";
+    case TASK_BLOCKED: return "BLOCKED";
+    case TASK_EXITED: return "EXITED";
+    default: return "UNUSED";
+    }
+}
+
+static void initialize_task_model(void)
+{
+    for (unsigned int i = 0U; i < MAX_TASKS; ++i) {
+        tasks[i].id = i;
+        tasks[i].state = TASK_UNUSED;
+        tasks[i].name[0] = '\0';
+        tasks[i].context.edi = 0U;
+        tasks[i].context.esi = 0U;
+        tasks[i].context.ebp = 0U;
+        tasks[i].context.esp = 0U;
+        tasks[i].context.ebx = 0U;
+        tasks[i].context.edx = 0U;
+        tasks[i].context.ecx = 0U;
+        tasks[i].context.eax = 0U;
+        tasks[i].context.eip = 0U;
+        tasks[i].context.eflags = 0U;
+    }
+
+    tasks[0].state = TASK_RUNNING;
+    tasks[0].name[0] = 'k';
+    tasks[0].name[1] = 'e';
+    tasks[0].name[2] = 'r';
+    tasks[0].name[3] = 'n';
+    tasks[0].name[4] = 'e';
+    tasks[0].name[5] = 'l';
+    tasks[0].name[6] = '\0';
+
+    /* This is an inspection snapshot, not a resumable interrupt frame.
+       The next milestone will define the real cooperative switch frame. */
+    __asm__ volatile (
+        "movl %%esp, %0\n\t"
+        "pushfl\n\t"
+        "popl %1\n\t"
+        "call 1f\n\t"
+        "1: popl %2\n\t"
+        : "=r" (tasks[0].context.esp),
+          "=r" (tasks[0].context.eflags),
+          "=r" (tasks[0].context.eip)
+        :
+        : "memory");
+
+    task_count = 1U;
+    current_task_id = 0U;
+    task_model_ready = 1;
+}
+
+static void show_task_info(void)
+{
+    if (!task_model_ready) {
+        put_string("Task model is not initialized.\n");
+        return;
+    }
+
+    put_string("Task model: initialized\nRegistered tasks: ");
+    put_unsigned(task_count);
+    put_string(" / ");
+    put_unsigned(MAX_TASKS);
+    put_string("\nCurrent task: ");
+    put_unsigned(current_task_id);
+    put_string(" (");
+    put_string(tasks[current_task_id].name);
+    put_string(") ");
+    put_string(task_state_name(tasks[current_task_id].state));
+    put_string("\nBootstrap context snapshot: ESP=0x");
+    put_hex32(tasks[0].context.esp);
+    put_string(" EIP=0x");
+    put_hex32(tasks[0].context.eip);
+    put_string(" EFLAGS=0x");
+    put_hex32(tasks[0].context.eflags);
+    put_string("\nTask slots: ");
+    put_unsigned(MAX_TASKS);
+    put_string("; reserved stack size per future task: ");
+    put_unsigned(TASK_STACK_SIZE);
+    put_string(" bytes\nTask switching: not enabled yet.\n");
 }
 
 static void put_hex64(unsigned int high, unsigned int low)
@@ -2814,7 +2937,7 @@ static void show_current_path(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, taskinfo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -2822,6 +2945,8 @@ static void run_command(void)
         put_string("Files persist on disk; 16 entries, 15-char names, up to 32768 chars per file.\n");
         put_string("Disk space is shared dynamically; remove or shrink files to free clusters.\n");
         put_string("Type a command and press Enter.\n");
+    } else if (command_is("taskinfo")) {
+        show_task_info();
     } else if (command_is("uptime")) {
         put_string("Uptime: ");
         put_unsigned(timer_uptime_seconds);
@@ -3494,6 +3619,7 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
        reported cleanly instead of triple-faulting. */
     initialize_idt();
     initialize_paging();
+    initialize_task_model();
     (void)heap_initialize();
     int file_store_result = initialize_file_store();
     clear_screen();
