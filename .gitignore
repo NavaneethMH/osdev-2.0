@@ -1,4 +1,5 @@
 build/
+build-*/
 *.iso
 disk/tinyos.img
 
