@@ -1,6 +1,7 @@
 /* TinyOS: a small freestanding x86 kernel for learning in QEMU. */
 #include "disk.h"
 #include "heap.h"
+#include "gdt.h"
 
 #define SCREEN_WIDTH 80U
 #define SCREEN_HEIGHT 25U
@@ -120,6 +121,9 @@ DECLARE_IRQ(44);  DECLARE_IRQ(45);  DECLARE_IRQ(46);  DECLARE_IRQ(47);
 #undef DECLARE_IRQ
 
 extern void idt_load(const struct idt_pointer *pointer);
+extern void enter_user_mode(unsigned int entry, unsigned int stack_top);
+extern void ring3_demo_user(void);
+extern void ring3_demo_return_trampoline(void);
 
 static volatile unsigned short *const video = (volatile unsigned short *)0xB8000;
 static unsigned int cursor = 0;
@@ -170,6 +174,10 @@ static int dynamic_page_table_used[VM_DYNAMIC_TABLES];
 static unsigned int dynamic_mapped_pages = 0U;
 static int paging_enabled = 0;
 
+static volatile int ring3_demo_active = 0;
+static volatile int ring3_demo_trap_seen = 0;
+static unsigned char ring3_demo_stack[4096] __attribute__((aligned(16)));
+
 /* Stage 2 task model. The bootstrap task continues on GRUB's stack while
    worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
 enum task_state {
@@ -178,7 +186,6 @@ enum task_state {
     TASK_RUNNING,
     TASK_BLOCKED,
     TASK_EXITED
-
 };
 
 struct task_context {
@@ -359,7 +366,6 @@ static const char *task_state_name(enum task_state state)
     case TASK_BLOCKED: return "BLOCKED";
     case TASK_EXITED: return "EXITED";
     default: return "UNUSED";
-
     }
 }
 
@@ -540,7 +546,6 @@ static void initialize_task_stack(unsigned int id, void (*entry)(void),
                                    const char *name)
 {
     struct task_control_block *task = &tasks[id];
-
     unsigned int *stack = (unsigned int *)
         ((unsigned int)&task->kernel_stack[TASK_STACK_SIZE]);
 
@@ -721,7 +726,6 @@ static void run_preempt_demo(void)
 
     initialize_preempt_stack(1U, task_preempt_worker_a, "timer-a");
     initialize_preempt_stack(2U, task_preempt_worker_b, "timer-b");
-
     task_count = 3U;
     task_switching_enabled = 1;
     put_string("Timer preemption demo: two workers run without yielding.\n");
@@ -902,7 +906,6 @@ static void initialize_page_allocator(void)
         unsigned int region_end = region->base_low + region->length_low;
         unsigned int start = region->base_low;
         if (start < kernel_end_address) {
-
             start = kernel_end_address;
         }
         if (start < 0x00100000U) {
@@ -1084,7 +1087,6 @@ static int vm_unmap_page(unsigned int virtual_address)
         return 0;
     }
 
-
     table[table_index] = 0U;
     if (dynamic_mapped_pages > 0U) {
         --dynamic_mapped_pages;
@@ -1264,7 +1266,6 @@ static char key_from_scancode(unsigned char code, int shifted, int caps_lock)
         case 0x04: character = '3'; break; case 0x05: character = '4'; break;
         case 0x06: character = '5'; break; case 0x07: character = '6'; break;
         case 0x08: character = '7'; break; case 0x09: character = '8'; break;
-
         case 0x0A: character = '9'; break; case 0x0B: character = '0'; break;
         case 0x0C: character = '-'; break; case 0x0D: character = '='; break;
         case 0x0E: return '\b'; /* Backspace */
@@ -1444,7 +1445,6 @@ static int file_name_valid(const char *name)
     }
     return 1;
 }
-
 
 /* Copies a NUL-terminated string. Returns 0 if it does not fit in max. */
 static int copy_string(char *dest, unsigned int max, const char *src)
@@ -1626,7 +1626,6 @@ static int filesystem_write_data_chain(unsigned short first_cluster,
         }
         int result = disk_write_sectors(filesystem_cluster_lba(cluster), 1U,
                                         filesystem_fat_disk);
-
         if (result < 0) {
             return result;
         }
@@ -1807,7 +1806,6 @@ static int filesystem_save_change(unsigned int slot,
                 (void)filesystem_release_chain(first, count);
                 file_entry_copy(&files[slot], previous);
                 return result;
-
             }
             result = filesystem_write_fat();
             if (result < 0) {
@@ -1988,7 +1986,6 @@ static int initialize_file_store(void)
         for (unsigned int i = 0; i <= FILENAME_MAX_LEN; ++i) {
             name[i] = (char)directory[offset + i];
             if (name[i] == '\0') {
-
                 terminated = 1;
                 break;
             }
@@ -2169,7 +2166,6 @@ static int initialize_file_store(void)
         /* Reclaim clusters orphaned by an interrupted create, rewrite, or rm.
            All live chains were checked and marked while loading directory data. */
         int found_orphan = 0;
-
         for (unsigned int i = 0; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
             if (filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE &&
                 !filesystem_cluster_seen[i]) {
@@ -2349,7 +2345,6 @@ static void inspect_file_chain(unsigned int slot)
                 return;
             }
         }
-
 
         result = disk_read_sectors(filesystem_cluster_lba(cluster), 1U,
                                    filesystem_fat_disk);
@@ -2531,7 +2526,6 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
                 ++summary->directories;
             } else {
                 ++summary->files;
-
             }
             if (!filesystem_bounded_content_length(files[slot].content,
                                                    &lengths[slot])) {
@@ -2712,7 +2706,6 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
                 filesystem_audit_error(summary,
                                        "could not read a file data sector.");
                 put_string(disk_error_string(result));
-
                 put_char('\n');
                 content_offset = lengths[slot];
                 break;
@@ -2849,7 +2842,7 @@ static void set_idt_gate(unsigned int vector, unsigned int handler,
     idt[vector].offset_low = (unsigned short)(handler & 0xFFFFU);
     idt[vector].selector = selector;
     idt[vector].zero = 0;
-    idt[vector].flags = 0x8E;
+    idt[vector].flags = (vector == 3U) ? 0xEEU : 0x8EU;
     idt[vector].offset_high = (unsigned short)((handler >> 16) & 0xFFFFU);
 }
 
@@ -2893,7 +2886,6 @@ static void set_irq_gates(unsigned short selector)
 
     static void (*const irq_stubs[16])(void) = {
         irq32, irq33, irq34, irq35, irq36, irq37, irq38, irq39,
-
         irq40, irq41, irq42, irq43, irq44, irq45, irq46, irq47
     };
 
@@ -3074,7 +3066,6 @@ static void report_page_fault(unsigned int error_code, unsigned int address)
         put_string("Reason: non-present page (address is not mapped).\n");
     }
     put_string("Access: ");
-
     put_string((error_code & 0x02U) != 0U ? "write\n" : "read\n");
     put_string("Privilege: ");
     put_string((error_code & 0x04U) != 0U ? "user mode\n" : "supervisor mode\n");
@@ -3097,8 +3088,26 @@ static void show_page_fault_demo(void)
     report_page_fault(0x15U, 0x00400000U);
 }
 
-void exception_handler(unsigned int vector, unsigned int error_code)
+struct exception_stack_frame {
+    unsigned int vector;
+    unsigned int error_code;
+    unsigned int eip;
+    unsigned int cs;
+    unsigned int eflags;
+    unsigned int user_esp;
+    unsigned int user_ss;
+} __attribute__((packed));
+
+void exception_handler(unsigned int vector, unsigned int error_code,
+                       struct exception_stack_frame *frame)
 {
+    if (vector == 3U && ring3_demo_active != 0 && frame != 0 &&
+        (frame->cs & 3U) == 3U) {
+        frame->eip = (unsigned int)ring3_demo_return_trampoline;
+        frame->cs = 0x08U;
+        ring3_demo_trap_seen = 1;
+        return;
+    }
     clear_screen();
     put_string("TinyOS stopped after a CPU exception.\n");
     put_string("Exception vector: 0x");
@@ -3106,14 +3115,11 @@ void exception_handler(unsigned int vector, unsigned int error_code)
     put_string("\nError code: 0x");
     put_hex32(error_code);
     put_string("\n");
-
-    /* Page fault (vector 14): decode its error bits and CR2 address. */
     if (vector == 14U) {
         unsigned int cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
         report_page_fault(error_code, cr2);
     }
-
     put_string("System halted.\n");
     for (;;) {
         __asm__ volatile ("cli; hlt");
@@ -3255,7 +3261,6 @@ static void run_heap_demo(void)
         middle[i] = (unsigned char)(i ^ 0x5AU);
     }
     for (unsigned int i = 0U; i < 40U; ++i) {
-
         last[i] = (unsigned char)(i + 1U);
     }
 
@@ -3395,10 +3400,27 @@ static void show_current_path(void)
     put_char('\n');
 }
 
+static void run_ring3_demo(void)
+{
+    if (paging_enabled == 0) {
+        put_string("Paging must be enabled before ring3demo.\n");
+        return;
+    }
+    ring3_demo_trap_seen = 0;
+    ring3_demo_active = 1;
+    enter_user_mode((unsigned int)ring3_demo_user,
+                    (unsigned int)(ring3_demo_stack + sizeof(ring3_demo_stack)));
+    ring3_demo_active = 0;
+    __asm__ volatile ("sti");
+    put_string(ring3_demo_trap_seen != 0
+        ? "Ring 3 entry and TSS kernel-stack return passed.\n"
+        : "Ring 3 demo returned without the expected breakpoint.\n");
+}
+
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3406,6 +3428,8 @@ static void run_command(void)
         put_string("Files persist on disk; 16 entries, 15-char names, up to 32768 chars per file.\n");
         put_string("Disk space is shared dynamically; remove or shrink files to free clusters.\n");
         put_string("Type a command and press Enter.\n");
+    } else if (command_is("ring3demo")) {
+        run_ring3_demo();
     } else if (command_is("taskinfo")) {
         show_task_info();
     } else if (command_is("taskdemo")) {
@@ -3436,7 +3460,6 @@ static void run_command(void)
         show_page_fault_demo();
     } else if (command_is("heapinfo")) {
         show_heap_info();
-
     } else if (command_is("heapcheck")) {
         show_heap_check();
     } else if (command_is("heapdemo")) {
@@ -3617,7 +3640,6 @@ static void run_command(void)
                                 put_string("Rename failed: ");
                                 put_string(file_store_error_message(result));
                                 put_char('\n');
-
                             } else {
                                 put_string("Renamed ");
                                 put_string(old_name);
@@ -3798,7 +3820,6 @@ static void run_command(void)
                 if (idx < 0) {
                     put_string("Directory not found: ");
                     put_string(name);
-
                     put_char('\n');
                 } else if (!files[idx].is_directory) {
                     put_string("Not a directory: ");
@@ -3979,7 +4000,6 @@ static void run_command(void)
         const char *name = command_args_after("cat ");
         if (!file_store_ready) {
             report_file_store_unavailable();
-
         } else if (name == 0) {
             put_string("Usage: cat <name>\n");
         } else if (!file_name_valid(name)) {
@@ -4086,6 +4106,7 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
     }
 
     initialize_page_allocator();
+    gdt_initialize();
     /* Install the IDT first so a page fault during paging setup is
        reported cleanly instead of triple-faulting. */
     initialize_idt();
