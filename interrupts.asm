@@ -84,18 +84,20 @@ IRQ_NOERR 47
 
 extern exception_handler
 extern irq_handler
+extern gdt_set_kernel_stack
 isr_common:
     cli
     cld
-    mov eax, [esp]
-    mov edx, [esp + 4]
-    push edx
+    pusha
+    lea eax, [esp + 32]
     push eax
+    push dword [eax + 4]
+    push dword [eax]
     call exception_handler
-.hang:
-    cli
-    hlt
-    jmp .hang
+    add esp, 12
+    popa
+    add esp, 8
+    iret
 
 irq_common:
     pusha                     ; Save all general-purpose registers (8 × 4 = 32 bytes)
@@ -109,6 +111,76 @@ irq_common:
     popa                      ; Restore all general-purpose registers
     add esp, 8                ; Remove pushed error code and IRQ number
     iret                      ; Return from interrupt
+
+global gdt_load
+gdt_load:
+    mov eax, [esp + 4]
+    lgdt [eax]
+    jmp 0x08:.reload_cs
+.reload_cs:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov ax, 0x28
+    ltr ax
+    ret
+
+; Enter ring 3 for the controlled privilege-transition demonstration.
+global enter_user_mode
+enter_user_mode:
+    cli
+    push ebx
+    push esi
+    mov ebx, [esp + 12]       ; entry argument
+    mov esi, [esp + 16]       ; user stack argument
+    mov eax, esp              ; TSS ring-0 stack top (saved-register frame)
+    push eax
+    call gdt_set_kernel_stack
+    add esp, 4
+
+    mov ax, 0x23              ; user data selector (RPL 3)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    push dword 0x23           ; user SS
+    push esi                  ; user ESP
+    push dword 0x2            ; safe EFLAGS: reserved bit set, IRQs disabled
+    push dword 0x1B           ; user CS (RPL 3)
+    push ebx                  ; user EIP
+
+    ; This milestone proves the privilege transition only. Paging is briefly
+    ; disabled because current mappings are supervisor-only; M3 adds user PTEs.
+    mov eax, cr0
+    and eax, 0x7FFFFFFF
+    mov cr0, eax
+    iretd
+
+global ring3_demo_user
+ring3_demo_user:
+    int3                      ; DPL-3 gate returns through the TSS stack
+.user_hang:
+    cli
+    hlt
+    jmp .user_hang
+
+global ring3_demo_return_trampoline
+ring3_demo_return_trampoline:
+    add esp, 8                ; discard user ESP/SS left by the privilege IRET
+    mov ax, 0x10              ; restore kernel data selectors
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, cr0
+    or eax, 0x80000000         ; restore paging for the kernel shell
+    mov cr0, eax
+    pop esi
+    pop ebx
+    ret
 
 global idt_load
 idt_load:
@@ -134,3 +206,4 @@ task_switch:
     pop ebx
     pop ebp
     ret
+
