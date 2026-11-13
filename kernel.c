@@ -124,6 +124,9 @@ extern void idt_load(const struct idt_pointer *pointer);
 extern void enter_user_mode(unsigned int entry, unsigned int stack_top);
 extern void ring3_demo_user(void);
 extern void ring3_demo_return_trampoline(void);
+extern void syscall128(void);
+extern void ring3_syscall_demo_user(void);
+extern unsigned char ring3_syscall_message[];
 
 static volatile unsigned short *const video = (volatile unsigned short *)0xB8000;
 static unsigned int cursor = 0;
@@ -177,6 +180,11 @@ static int paging_enabled = 0;
 static volatile int ring3_demo_active = 0;
 static volatile int ring3_demo_trap_seen = 0;
 static unsigned char ring3_demo_stack[4096] __attribute__((aligned(16)));
+static volatile int syscall_demo_active = 0;
+static volatile int syscall_demo_write_seen = 0;
+static volatile int syscall_demo_yield_seen = 0;
+static volatile int syscall_demo_exit_seen = 0;
+static unsigned char syscall_demo_stack[4096] __attribute__((aligned(16)));
 
 /* Stage 2 task model. The bootstrap task continues on GRUB's stack while
    worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
@@ -2842,7 +2850,7 @@ static void set_idt_gate(unsigned int vector, unsigned int handler,
     idt[vector].offset_low = (unsigned short)(handler & 0xFFFFU);
     idt[vector].selector = selector;
     idt[vector].zero = 0;
-    idt[vector].flags = (vector == 3U) ? 0xEEU : 0x8EU;
+    idt[vector].flags = (vector == 3U || vector == 128U) ? 0xEEU : 0x8EU;
     idt[vector].offset_high = (unsigned short)((handler >> 16) & 0xFFFFU);
 }
 
@@ -2868,6 +2876,7 @@ static void initialize_idt(void)
     for (unsigned int i = 0; i < 32U; ++i) {
         set_idt_gate(i, (unsigned int)stubs[i], code_selector);
     }
+    set_idt_gate(128U, (unsigned int)syscall128, code_selector);
 
     /* Set up IRQ gates for hardware interrupts 32-47 */
     set_irq_gates(code_selector);
@@ -3125,6 +3134,76 @@ void exception_handler(unsigned int vector, unsigned int error_code,
         __asm__ volatile ("cli; hlt");
     }
 }
+
+/* int 0x80 saves the user register set before entering this C dispatcher.
+   This milestone deliberately accepts only the demo's fixed message buffer;
+   general user-pointer validation is a later isolation milestone. */
+struct syscall_cpu_frame {
+    unsigned int edi;
+    unsigned int esi;
+    unsigned int ebp;
+    unsigned int saved_esp;
+    unsigned int ebx;
+    unsigned int edx;
+    unsigned int ecx;
+    unsigned int eax;
+    unsigned int vector;
+    unsigned int error_code;
+    unsigned int eip;
+    unsigned int cs;
+    unsigned int eflags;
+    unsigned int user_esp;
+    unsigned int user_ss;
+} __attribute__((packed));
+
+enum syscall_number {
+    SYSCALL_WRITE = 1U,
+    SYSCALL_EXIT = 2U,
+    SYSCALL_YIELD = 3U
+};
+
+#define SYSCALL_DEMO_MESSAGE_LENGTH 41U
+
+void syscall_handler(struct syscall_cpu_frame *frame)
+{
+    if (frame == 0 || frame->vector != 128U ||
+        (frame->cs & 3U) != 3U || syscall_demo_active == 0) {
+        return;
+    }
+
+    switch (frame->eax) {
+        case SYSCALL_WRITE:
+            if (frame->ebx == (unsigned int)ring3_syscall_message &&
+                frame->ecx == SYSCALL_DEMO_MESSAGE_LENGTH) {
+                const unsigned char *message = ring3_syscall_message;
+                for (unsigned int i = 0; i < frame->ecx; ++i) {
+                    put_char((char)message[i]);
+                }
+                syscall_demo_write_seen = 1;
+                frame->eax = frame->ecx;
+            } else {
+                frame->eax = 0xFFFFFFFFU;
+            }
+            break;
+
+        case SYSCALL_YIELD:
+            ++syscall_demo_yield_seen;
+            task_yield();
+            frame->eax = 0U;
+            break;
+
+        case SYSCALL_EXIT:
+            syscall_demo_exit_seen = 1;
+            frame->eip = (unsigned int)ring3_demo_return_trampoline;
+            frame->cs = 0x08U;
+            break;
+
+        default:
+            frame->eax = 0xFFFFFFFFU;
+            break;
+    }
+}
+
 static void show_prompt(void)
 {
     put_string("tinyos> ");
@@ -3417,10 +3496,40 @@ static void run_ring3_demo(void)
         : "Ring 3 demo returned without the expected breakpoint.\n");
 }
 
+static void run_syscall_demo(void)
+{
+    if (paging_enabled == 0) {
+        put_string("Paging must be enabled before syscalldemo.\n");
+        return;
+    }
+
+    syscall_demo_write_seen = 0;
+    syscall_demo_yield_seen = 0;
+    syscall_demo_exit_seen = 0;
+    syscall_demo_active = 1;
+    enter_user_mode((unsigned int)ring3_syscall_demo_user,
+                    (unsigned int)(syscall_demo_stack + sizeof(syscall_demo_stack)));
+    syscall_demo_active = 0;
+    __asm__ volatile ("sti");
+
+    if (syscall_demo_write_seen != 0 && syscall_demo_yield_seen == 1U &&
+        syscall_demo_exit_seen != 0) {
+        put_string("System-call demo passed: write, yield, and exit returned safely.\n");
+    } else {
+        put_string("System-call demo incomplete: write=");
+        put_unsigned((unsigned int)syscall_demo_write_seen);
+        put_string(" yield=");
+        put_unsigned((unsigned int)syscall_demo_yield_seen);
+        put_string(" exit=");
+        put_unsigned((unsigned int)syscall_demo_exit_seen);
+        put_char('\n');
+    }
+}
+
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3430,6 +3539,8 @@ static void run_command(void)
         put_string("Type a command and press Enter.\n");
     } else if (command_is("ring3demo")) {
         run_ring3_demo();
+    } else if (command_is("syscalldemo")) {
+        run_syscall_demo();
     } else if (command_is("taskinfo")) {
         show_task_info();
     } else if (command_is("taskdemo")) {
@@ -4158,4 +4269,3 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         }
     }
 }
-
