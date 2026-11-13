@@ -21,6 +21,7 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - Task groundwork: task states, IDs, saved CPU contexts, per-task 4 KiB stacks, cooperative yields, timed blocking/wakeup, and a round-robin scheduler demo
 - Shell commands `taskinfo`, `taskdemo`, `sleepdemo`, and `preemptdemo`; the preemption demo lets the PIT timer switch between workers that do not yield
 - Stage 3 privilege groundwork: kernel/user GDT descriptors, a 32-bit TSS, and a controlled `ring3demo` transition that returns through the TSS kernel stack
+- Stage 3 system-call groundwork: a user-callable `int 0x80` gate with a controlled `syscalldemo` for `write`, `yield`, and `exit`
 - Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
 - FAT-style free-space map and linked disk clusters, allowing files to share disk space and reclaim it after deletion or rewrite
 - Basic ATA/IDE primary-master PIO driver with bounded LBA-28 sector reads and writes
@@ -58,7 +59,7 @@ The keyboard uses a US QWERTY scan-code map. Either Shift key changes letters to
 
 File commands: `ls` lists entries in the current directory (`/` marks directories), `mkdir <name>` creates a directory, `cd <name>` enters one, `cd ..` goes up, `cd /` returns to the root, and `pwd` prints the current path. `rmdir <name>` removes an empty directory. `touch <name>` creates an empty file, `write <name> <text>` creates or replaces a file (spaces are allowed in the text), `cat <name>` prints it, and `rm <name>` deletes it. `rename <old> <new>` changes a file or directory's name in the current directory; it refuses a name that already exists there and preserves the file's data clusters. `cp <source> <destination>` copies a file to a new name in the current directory, allocating independent data clusters and refusing to overwrite an existing entry. `df` shows free space. Directories and files share a limit of 16 total entries. Names can contain up to 15 characters; file contents can contain up to 32768 characters (64 disk sectors). The shell accepts long command lines so `write` can store content larger than one sector. The current directory starts at `/` after each restart. Metadata and contents are saved on the QEMU virtual disk.
 
-Stage 3, Milestone 1 test: run `ring3demo`. It should report `Ring 3 entry and TSS kernel-stack return passed.` and return to the shell. Then run `uptime` and `help` to confirm shell operation. This is only a privilege-transition demonstration: paging is temporarily disabled while the tiny ring-3 stub runs because user-accessible memory mappings are not implemented yet. It does not provide process isolation or safe execution of general user programs. Stage 3, Milestone 1 is complete and verified in QEMU.
+Stage 3, Milestone 1 test: run `ring3demo`. It should report `Ring 3 entry and TSS kernel-stack return passed.` and return to the shell. Then run `uptime` and `help` to confirm shell operation. This is only a privilege-transition demonstration: paging is temporarily disabled while the tiny ring-3 stub runs because user-accessible memory mappings are not implemented yet. It does not provide process isolation or safe execution of general user programs. Stage 3, Milestone 1 is complete and verified in QEMU. Stage 3, Milestone 2 test: run `syscalldemo`. The ring-3 stub should print `Ring 3 says hello through write syscall.` using syscall 1, invoke syscall 3 (`yield`), then invoke syscall 2 (`exit`) and return through the TSS kernel stack. The shell should print `System-call demo passed: write, yield, and exit returned safely.` Then run `ring3demo`, `uptime`, and `help` to confirm shell operation. This is a controlled demonstration: `write` accepts only its fixed message buffer, and `yield` uses the existing scheduler. Paging remains temporarily disabled in ring 3; general user-pointer validation and process isolation are future work. Stage 3, Milestone 2 is complete and verified in QEMU.
 
 To check renaming, run `write draft keep this text`, `df`, `rename draft final`, `cat final`, and `df` again; the content should remain and cluster usage should not change. `cat draft` should report that the old name is missing. Create a directory with `mkdir olddir`, rename it with `rename olddir newdir`, then run `cd newdir` and `pwd`; the path should show `/newdir`. Try `rename final newdir` to confirm an existing destination name is refused. Restart TinyOS and run `cat final` to confirm the new name persists.
 
@@ -87,6 +88,16 @@ make iso
 ```
 
 The ISO is written to `build/tinyos.iso`.
+
+To build this milestone in its own output folder, then create and launch its ISO:
+
+```bash
+make clean BUILD_DIR=build-syscall
+make iso BUILD_DIR=build-syscall
+make run BUILD_DIR=build-syscall
+```
+
+The ISO is `build-syscall/tinyos.iso`. In VirtualBox, attach it to the optical drive and set Optical before Hard Disk in the boot order. The ISO is generated locally and is not committed to GitHub.
 
 ## Roadmap
 
@@ -120,6 +131,7 @@ For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report 
 24. (Stage 2, Milestone 3 — Complete; verified in QEMU) Save and restore task interrupt frames so PIT IRQ0 can preempt workers in `preemptdemo` without explicit yields.
 25. (Stage 2, Milestone 4 — Complete; verified in QEMU) Add sleep, exit and cleanup; keep interrupt handlers short and safe. `sleepdemo` exercises PIT-based blocking and wakeups, workers exit when their entry functions return, and the shell reclaims exited task metadata after switching off the worker stack. IRQ0 records that a tick passed; task context checks sleep deadlines.
 26. (Stage 3, Milestone 1 — Complete; verified in QEMU) Add kernel/user privilege descriptors, a TSS kernel-stack pointer, and a controlled ring-3 entry/return demo.
+27. (Stage 3, Milestone 2 — Complete; verified in QEMU) Add a user-callable system-call entry and the initial `write`, `yield`, and `exit` services.
 
 ## License
 
