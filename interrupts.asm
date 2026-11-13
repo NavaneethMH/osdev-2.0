@@ -31,6 +31,14 @@ irq%1:
     jmp irq_common
 %endmacro
 
+%macro SYSCALL_NOERR 1
+global syscall%1
+syscall%1:
+    push dword 0
+    push dword %1
+    jmp syscall_common
+%endmacro
+
 ISR_NOERR 0
 ISR_NOERR 1
 ISR_NOERR 2
@@ -82,9 +90,13 @@ IRQ_NOERR 45
 IRQ_NOERR 46
 IRQ_NOERR 47
 
+; User-callable system-call gate (int 0x80).
+SYSCALL_NOERR 128
+
 extern exception_handler
 extern irq_handler
 extern gdt_set_kernel_stack
+extern syscall_handler
 isr_common:
     cli
     cld
@@ -111,6 +123,17 @@ irq_common:
     popa                      ; Restore all general-purpose registers
     add esp, 8                ; Remove pushed error code and IRQ number
     iret                      ; Return from interrupt
+
+syscall_common:
+    cli
+    cld
+    pusha
+    push esp                  ; syscall_handler(struct syscall_cpu_frame *)
+    call syscall_handler
+    add esp, 4
+    popa
+    add esp, 8                ; Remove vector and synthetic error code
+    iret
 
 global gdt_load
 gdt_load:
@@ -182,6 +205,29 @@ ring3_demo_return_trampoline:
     pop ebx
     ret
 
+; Controlled user-mode ABI exercise: eax selects the service and ebx/ecx
+; carry write's buffer and length. Exit returns through the shared trampoline.
+global ring3_syscall_demo_user
+ring3_syscall_demo_user:
+    mov eax, 1                ; SYS_WRITE
+    mov ebx, ring3_syscall_message
+    mov ecx, ring3_syscall_message_end - ring3_syscall_message
+    int 0x80
+    mov eax, 3                ; SYS_YIELD
+    int 0x80
+    mov eax, 2                ; SYS_EXIT
+    int 0x80
+.syscall_demo_hang:
+    cli
+    hlt
+    jmp .syscall_demo_hang
+
+global ring3_syscall_message
+ring3_syscall_message:
+    db "Ring 3 says hello through write syscall.", 10
+global ring3_syscall_message_end
+ring3_syscall_message_end:
+
 global idt_load
 idt_load:
     mov eax, [esp + 4]
@@ -206,4 +252,3 @@ task_switch:
     pop ebx
     pop ebp
     ret
-
