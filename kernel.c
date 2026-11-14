@@ -2,6 +2,7 @@
 #include "disk.h"
 #include "heap.h"
 #include "gdt.h"
+#include "elf.h"
 
 #define SCREEN_WIDTH 80U
 #define SCREEN_HEIGHT 25U
@@ -3758,10 +3759,19 @@ static void run_user_protection_demo(void)
         : "Protection demo failed: expected kernel-page write fault was not observed.\n");
 }
 
+static void run_elf_validation_demo(void)
+{
+    if (elf32_validation_demo()) {
+        put_string("ELF32 validation passed: valid image accepted; malformed headers and loadable segments rejected.\n");
+    } else {
+        put_string("ELF32 validation demo failed.\n");
+    }
+}
+
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3775,6 +3785,8 @@ static void run_command(void)
         run_syscall_demo();
     } else if (command_is("usermemdemo")) {
         run_user_protection_demo();
+    } else if (command_is("elfdemo")) {
+        run_elf_validation_demo();
     } else if (command_is("taskinfo")) {
         show_task_info();
     } else if (command_is("taskdemo")) {
