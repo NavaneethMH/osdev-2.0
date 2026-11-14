@@ -23,6 +23,7 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - Stage 3 privilege groundwork: kernel/user GDT descriptors, a 32-bit TSS, and a controlled `ring3demo` transition that returns through the TSS kernel stack
 - Stage 3 system calls: a user-callable `int 0x80` gate for `write`, `yield`, and `exit`, with bounds and page-permission checks on output buffers
 - Stage 3 memory protection: temporary user code and stack pages have explicit user permissions, user code is read-only, and kernel identity mappings remain supervisor-only
+- ELF32 validation demo: checks a static i386 executable header and loadable segments, rejecting malformed ranges and unsafe permissions
 - Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
 - FAT-style free-space map and linked disk clusters, allowing files to share disk space and reclaim it after deletion or rewrite
 - Basic ATA/IDE primary-master PIO driver with bounded LBA-28 sector reads and writes
@@ -68,6 +69,8 @@ Stage 3, Milestone 3 test: run `usermemdemo`. It should report user code as `use
 
 Stage 3, Milestone 4 test: run `syscalldemo`. It should print the normal message, then report that write/yield/exit work and that a kernel pointer, a buffer crossing into an unmapped page, an oversized buffer, and an unknown syscall number were rejected. The demo also verifies the user code observed each error and exits with status zero. Then run `usermemdemo`, `ring3demo`, `uptime`, and `help`. The syscall gate remains restricted to the controlled demo; general processes, file syscalls, and per-process address spaces are future work. Stage 3, Milestone 4 is complete and verified in VirtualBox.
 
+Stage 4, Milestone 1 test: run `elfdemo`. It accepts a small well-formed ELF32 executable and rejects malformed magic, unsupported class, an out-of-bounds program-header table, an invalid load segment, a segment outside the allowed user-address range, an entry point outside file-backed executable memory, and a writable/executable segment. This milestone adds parsing and validation only; it does not yet load or run applications. The parser currently accepts static i386 `ET_EXEC` images only. Then run `syscalldemo`, `usermemdemo`, `uptime`, and `help` to check the existing kernel shell and user-mode demonstrations. Stage 4, Milestone 1 is complete and verified in VirtualBox.
+
 To check renaming, run `write draft keep this text`, `df`, `rename draft final`, `cat final`, and `df` again; the content should remain and cluster usage should not change. `cat draft` should report that the old name is missing. Create a directory with `mkdir olddir`, rename it with `rename olddir newdir`, then run `cd newdir` and `pwd`; the path should show `/newdir`. Try `rename final newdir` to confirm an existing destination name is refused. Restart TinyOS and run `cat final` to confirm the new name persists.
 
 To check copying, run `write original copy this text`, `cp original duplicate`, `cat original`, and `cat duplicate`; both should show the same contents. Run `write duplicate changed` and confirm `cat original` still shows the original text. Try `cp original duplicate` again to check that an existing destination is not overwritten. Restart TinyOS and run `cat duplicate` to confirm the copy persisted independently.
@@ -94,7 +97,7 @@ To build the ISO without starting QEMU:
 make iso
 ```
 
-The current combined TinyOS source builds to one ISO at `build/tinyos.iso`. Each milestone updates the same output when you run `make iso`; there is no need to merge older ISO images because their code changes are already part of the source tree. Attach `build/tinyos.iso` to the VM's optical drive and boot from Optical before Hard Disk. Generated ISO files are not committed to GitHub.
+The current combined TinyOS source builds to one ISO at `build/tinyos.iso`. Each milestone updates the same output when you run `make iso`; there is no need to merge older ISO images because their code changes are already part of the source tree. The build stages files on Linux's local `/tmp` filesystem, extracts the kernel and GRUB configuration from the resulting ISO, and compares them with the originals before copying the ISO into `build/`. This also avoids zero-length ISO entries when the project is under a VirtualBox shared folder. Attach `build/tinyos.iso` to the VM's optical drive and boot from Optical before Hard Disk. Generated ISO files are not committed to GitHub.
 
 For a clean rebuild into that same location, run `make clean` and then `make iso`. Close the VM first if it is currently using the ISO.
 
@@ -133,6 +136,7 @@ For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report 
 27. (Stage 3, Milestone 2 — Complete; verified in QEMU) Add a user-callable system-call entry and the initial `write`, `yield`, and `exit` services.
 28. (Stage 3, Milestone 3 — Complete; verified in VirtualBox) Map dedicated user code/stack pages with appropriate permissions and contain a user-mode write attempt against a supervisor-only kernel page.
 29. (Stage 3, Milestone 4 — Complete; verified in VirtualBox) Validate syscall numbers and every page in bounded user output-buffer ranges; reject kernel pointers, unmapped cross-page ranges, and oversized writes before reading them.
+30. (Stage 4, Milestone 1 — Complete; verified in VirtualBox) Parse and validate ELF32 headers and loadable segments; reject malformed files safely.
 
 ## License
 
