@@ -151,7 +151,8 @@ gdt_load:
     ltr ax
     ret
 
-; Enter ring 3 for the controlled privilege-transition demonstration.
+; Enter ring 3 with paging left enabled. Callers must provide mapped user
+; code and stack pages; the kernel identity map stays supervisor-only.
 global enter_user_mode
 enter_user_mode:
     cli
@@ -175,20 +176,7 @@ enter_user_mode:
     push dword 0x1B           ; user CS (RPL 3)
     push ebx                  ; user EIP
 
-    ; This milestone proves the privilege transition only. Paging is briefly
-    ; disabled because current mappings are supervisor-only; M3 adds user PTEs.
-    mov eax, cr0
-    and eax, 0x7FFFFFFF
-    mov cr0, eax
     iretd
-
-global ring3_demo_user
-ring3_demo_user:
-    int3                      ; DPL-3 gate returns through the TSS stack
-.user_hang:
-    cli
-    hlt
-    jmp .user_hang
 
 global ring3_demo_return_trampoline
 ring3_demo_return_trampoline:
@@ -198,19 +186,31 @@ ring3_demo_return_trampoline:
     mov es, ax
     mov fs, ax
     mov gs, ax
-    mov eax, cr0
-    or eax, 0x80000000         ; restore paging for the kernel shell
-    mov cr0, eax
     pop esi
     pop ebx
     ret
 
-; Controlled user-mode ABI exercise: eax selects the service and ebx/ecx
-; carry write's buffer and length. Exit returns through the shared trampoline.
+; This contiguous blob is copied into a dedicated read-only user page.
+global user_blob_start
+user_blob_start:
+; Controlled ring-3 privilege transition proof.
+global ring3_demo_user
+ring3_demo_user:
+    int3
+.user_hang:
+    cli
+    hlt
+    jmp .user_hang
+
+; Controlled user-mode ABI exercise. Derive the message address from the
+; current instruction pointer so this code remains relocatable when copied.
 global ring3_syscall_demo_user
 ring3_syscall_demo_user:
+    call .get_base
+.get_base:
+    pop esi
     mov eax, 1                ; SYS_WRITE
-    mov ebx, ring3_syscall_message
+    lea ebx, [esi + ring3_syscall_message - .get_base]
     mov ecx, ring3_syscall_message_end - ring3_syscall_message
     int 0x80
     mov eax, 3                ; SYS_YIELD
@@ -227,6 +227,18 @@ ring3_syscall_message:
     db "Ring 3 says hello through write syscall.", 10
 global ring3_syscall_message_end
 ring3_syscall_message_end:
+
+; Deliberately attempt a ring-3 write to supervisor-only VGA memory. The
+; kernel contains this expected page fault and returns through the TSS stack.
+global ring3_protection_demo_user
+ring3_protection_demo_user:
+    mov dword [0x000B8000], 0xDEADBEEF
+.protection_hang:
+    cli
+    hlt
+    jmp .protection_hang
+global user_blob_end
+user_blob_end:
 
 global idt_load
 idt_load:
