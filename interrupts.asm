@@ -209,12 +209,51 @@ ring3_syscall_demo_user:
     call .get_base
 .get_base:
     pop esi
+    mov edi, 0                ; Exit status stays zero only if every check passes.
     mov eax, 1                ; SYS_WRITE
     lea ebx, [esi + ring3_syscall_message - .get_base]
     mov ecx, ring3_syscall_message_end - ring3_syscall_message
     int 0x80
+    cmp eax, ring3_syscall_message_end - ring3_syscall_message
+    jne .checks_failed
+
+    ; A supervisor-only kernel address must be rejected without dereference.
+    mov eax, 1                ; SYS_WRITE
+    mov ebx, 0x000B8000
+    mov ecx, 4
+    int 0x80
+    cmp eax, 0xFFFFFFFF
+    jne .checks_failed
+
+    ; Reject a buffer larger than the bounded write limit.
+    mov eax, 1                ; SYS_WRITE
+    lea ebx, [esi + ring3_syscall_message - .get_base]
+    mov ecx, 129
+    int 0x80
+    cmp eax, 0xFFFFFFFF
+    jne .checks_failed
+
+    ; Reject a range that starts in the user stack but crosses into an
+    ; unmapped page, even though its first byte is user-accessible.
+    mov eax, 1                ; SYS_WRITE
+    mov ebx, 0x40001FFF
+    mov ecx, 2
+    int 0x80
+    cmp eax, 0xFFFFFFFF
+    jne .checks_failed
+
+    ; Unknown syscall numbers must return the same explicit error value.
+    mov eax, 99
+    int 0x80
+    cmp eax, 0xFFFFFFFF
+    jne .checks_failed
+    jmp .after_checks
+.checks_failed:
+    mov edi, 1
+.after_checks:
     mov eax, 3                ; SYS_YIELD
     int 0x80
+    mov ebx, edi              ; SYS_EXIT returns this test status to the kernel.
     mov eax, 2                ; SYS_EXIT
     int 0x80
 .syscall_demo_hang:
@@ -264,3 +303,4 @@ task_switch:
     pop ebx
     pop ebp
     ret
+
