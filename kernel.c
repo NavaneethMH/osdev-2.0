@@ -132,6 +132,8 @@ extern void ring3_demo_return_trampoline(void);
 extern void syscall128(void);
 extern unsigned char user_blob_start[];
 extern unsigned char user_blob_end[];
+extern unsigned char _binary_build_hello_elf_start[];
+extern unsigned char _binary_build_hello_elf_end[];
 extern void ring3_syscall_demo_user(void);
 extern void ring3_protection_demo_user(void);
 extern unsigned char ring3_syscall_message[];
@@ -203,6 +205,10 @@ static volatile int syscall_demo_unknown_number_seen = 0;
 static volatile unsigned int syscall_demo_exit_status = 0xFFFFFFFFU;
 static volatile int user_protection_fault_seen = 0;
 static volatile int user_demo_active = 0;
+static volatile int embedded_app_active = 0;
+static volatile int embedded_app_exit_seen = 0;
+static volatile unsigned int embedded_app_exit_status = 0xFFFFFFFFU;
+static unsigned int *active_user_address_space = 0;
 static unsigned int user_code_physical = 0U;
 static unsigned int user_stack_physical = 0U;
 static unsigned int address_space_code_physical = 0U;
@@ -1169,21 +1175,24 @@ static int syscall_user_buffer_readable(unsigned int address,
         address > 0xFFFFFFFFU - (length - 1U)) {
         return 0;
     }
-
     unsigned int last = address + length - 1U;
     unsigned int page = address & ~(PAGE_SIZE - 1U);
     unsigned int last_page = last & ~(PAGE_SIZE - 1U);
+    unsigned int *directory = active_user_address_space != 0
+        ? active_user_address_space : page_directory;
     for (;;) {
         unsigned int directory_index = page >> 22;
-        unsigned int directory_flags = page_directory[directory_index];
-        unsigned int page_flags = vm_page_flags(page);
+        unsigned int page_index = (page >> 12) & 0x3FFU;
+        unsigned int directory_entry = directory[directory_index];
+        unsigned int directory_flags = directory_entry & 0xFFFU;
+        unsigned int page_flags = 0U;
+        if ((directory_entry & 0x01U) != 0U) {
+            unsigned int *table = (unsigned int *)(directory_entry & 0xFFFFF000U);
+            page_flags = table[page_index] & 0xFFFU;
+        }
         if ((directory_flags & 0x05U) != 0x05U ||
-            (page_flags & 0x05U) != 0x05U) {
-            return 0;
-        }
-        if (page == last_page) {
-            return 1;
-        }
+            (page_flags & 0x05U) != 0x05U) return 0;
+        if (page == last_page) return 1;
         page += PAGE_SIZE;
     }
 }
@@ -3454,55 +3463,67 @@ enum syscall_number {
 void syscall_handler(struct syscall_cpu_frame *frame)
 {
     if (frame == 0 || frame->vector != 128U ||
-        (frame->cs & 3U) != 3U || syscall_demo_active == 0) {
+        (frame->cs & 3U) != 3U ||
+        (syscall_demo_active == 0 && embedded_app_active == 0)) {
         return;
     }
 
     switch (frame->eax) {
         case SYSCALL_WRITE:
-            if (frame->ebx == 0x000B8000U && frame->ecx == 4U) {
-                syscall_demo_bad_pointer_seen = 1;
-            } else if (frame->ebx == USER_STACK_ADDRESS + PAGE_SIZE - 1U &&
-                       frame->ecx == 2U) {
-                syscall_demo_cross_page_seen = 1;
-            } else if (frame->ecx > SYSCALL_WRITE_MAX) {
-                syscall_demo_large_buffer_seen = 1;
+            if (syscall_demo_active != 0) {
+                if (frame->ebx == 0x000B8000U && frame->ecx == 4U) {
+                    syscall_demo_bad_pointer_seen = 1;
+                } else if (frame->ebx == USER_STACK_ADDRESS + PAGE_SIZE - 1U &&
+                           frame->ecx == 2U) {
+                    syscall_demo_cross_page_seen = 1;
+                } else if (frame->ecx > SYSCALL_WRITE_MAX) {
+                    syscall_demo_large_buffer_seen = 1;
+                }
             }
-
             if (!syscall_user_buffer_readable(frame->ebx, frame->ecx)) {
                 frame->eax = 0xFFFFFFFFU;
                 break;
             }
-
             const unsigned char *message =
                 (const unsigned char *)frame->ebx;
             for (unsigned int i = 0; i < frame->ecx; ++i) {
                 put_char((char)message[i]);
             }
-            syscall_demo_write_seen = 1;
+            if (syscall_demo_active != 0) {
+                syscall_demo_write_seen = 1;
+            }
             frame->eax = frame->ecx;
             break;
 
         case SYSCALL_YIELD:
-            ++syscall_demo_yield_seen;
+            if (syscall_demo_active != 0) {
+                ++syscall_demo_yield_seen;
+            }
             task_yield();
             frame->eax = 0U;
             break;
 
         case SYSCALL_EXIT:
-            syscall_demo_exit_seen = 1;
-            syscall_demo_exit_status = frame->ebx;
+            if (syscall_demo_active != 0) {
+                syscall_demo_exit_seen = 1;
+                syscall_demo_exit_status = frame->ebx;
+            }
+            if (embedded_app_active != 0) {
+                embedded_app_exit_seen = 1;
+                embedded_app_exit_status = frame->ebx;
+            }
             frame->eip = (unsigned int)ring3_demo_return_trampoline;
             frame->cs = 0x08U;
             break;
 
         default:
-            syscall_demo_unknown_number_seen = 1;
+            if (syscall_demo_active != 0) {
+                syscall_demo_unknown_number_seen = 1;
+            }
             frame->eax = 0xFFFFFFFFU;
             break;
     }
 }
-
 static void show_prompt(void)
 {
     put_string("tinyos> ");
@@ -3835,6 +3856,108 @@ static void run_address_space_demo(void)
         : "Address-space demo failed: user code did not return as expected.\n");
 }
 
+/* Load the milestone's small embedded ELF into the dedicated user window.
+   General multi-page loading and filesystem-backed executables are later work. */
+static int prepare_embedded_hello_address_space(
+    const unsigned char *image,
+    const struct elf32_image_info *info)
+{
+    if (!paging_enabled || !page_allocator_available || image == 0 ||
+        info == 0 || info->load_segment_count != 1U ||
+        (page_directory[USER_ADDRESS_SPACE_DIRECTORY] & 0x01U) != 0U) {
+        return 0;
+    }
+
+    const struct elf32_load_segment *segment = &info->segments[0];
+    if (segment->virtual_address < USER_CODE_ADDRESS ||
+        segment->virtual_address >= USER_STACK_ADDRESS ||
+        segment->memory_size > USER_STACK_ADDRESS - segment->virtual_address ||
+        segment->file_size > PAGE_SIZE ||
+        (segment->flags & 0x01U) == 0U ||
+        (segment->flags & 0x02U) != 0U ||
+        info->entry < segment->virtual_address ||
+        info->entry >= segment->virtual_address + segment->file_size) {
+        return 0;
+    }
+
+    address_space_code_physical = allocate_page();
+    if (address_space_code_physical == 0U) return 0;
+    address_space_stack_physical = allocate_page();
+    if (address_space_stack_physical == 0U) {
+        (void)release_page(address_space_code_physical);
+        address_space_code_physical = 0U;
+        return 0;
+    }
+
+    for (unsigned int i = 0U; i < 1024U; ++i) {
+        user_address_space_directory[i] = 0U;
+        user_address_space_table[i] = 0U;
+    }
+    for (unsigned int i = 0U; i < PAGE_TABLES_FOR_LIMIT; ++i) {
+        user_address_space_directory[i] = page_directory[i] & ~0x04U;
+    }
+
+    clear_physical_page(address_space_code_physical);
+    clear_physical_page(address_space_stack_physical);
+    unsigned char *destination = (unsigned char *)address_space_code_physical;
+    unsigned int code_offset = segment->virtual_address - USER_CODE_ADDRESS;
+    for (unsigned int i = 0U; i < segment->file_size; ++i) {
+        destination[code_offset + i] = image[segment->offset + i];
+    }
+
+    unsigned int *stack = (unsigned int *)address_space_stack_physical;
+    unsigned int initial_words = PAGE_SIZE / sizeof(unsigned int) - 3U;
+    stack[initial_words] = 0U;
+    stack[initial_words + 1U] = 0U;
+    stack[initial_words + 2U] = 0U;
+
+    unsigned int code_index = (USER_CODE_ADDRESS >> 12) & 0x3FFU;
+    unsigned int stack_index = (USER_STACK_ADDRESS >> 12) & 0x3FFU;
+    user_address_space_table[code_index] = address_space_code_physical | 0x05U;
+    user_address_space_table[stack_index] = address_space_stack_physical | 0x07U;
+    user_address_space_directory[USER_ADDRESS_SPACE_DIRECTORY] =
+        (unsigned int)&user_address_space_table[0] | 0x07U;
+    return 1;
+}
+
+static void run_embedded_hello(void)
+{
+    unsigned int image_size = (unsigned int)_binary_build_hello_elf_end -
+                              (unsigned int)_binary_build_hello_elf_start;
+    struct elf32_image_info info;
+    if (elf32_validate(_binary_build_hello_elf_start, image_size, &info) !=
+        ELF32_VALID) {
+        put_string("Embedded app 'hello' failed ELF validation.\n");
+        return;
+    }
+    if (!prepare_embedded_hello_address_space(
+            _binary_build_hello_elf_start, &info)) {
+        put_string("Could not load embedded app 'hello'.\n");
+        return;
+    }
+
+    embedded_app_exit_seen = 0;
+    embedded_app_exit_status = 0xFFFFFFFFU;
+    embedded_app_active = 1;
+    active_user_address_space = user_address_space_directory;
+    load_page_directory(user_address_space_directory);
+    enter_user_mode(info.entry, USER_STACK_ADDRESS + PAGE_SIZE -
+                    3U * sizeof(unsigned int));
+    load_page_directory(page_directory);
+    active_user_address_space = 0;
+    embedded_app_active = 0;
+    cleanup_user_address_space();
+    __asm__ volatile ("sti");
+
+    if (embedded_app_exit_seen != 0) {
+        put_string("Application 'hello' exited with status ");
+        put_unsigned(embedded_app_exit_status);
+        put_string(".\n");
+    } else {
+        put_string("Application 'hello' returned without an exit status.\n");
+    }
+}
+
 static void run_syscall_demo(void)
 {
     if (paging_enabled == 0) {
@@ -3942,7 +4065,8 @@ static void run_elf_validation_demo(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, run <app>\n");
+        put_string("Apps: run hello starts the embedded ELF32 hello app.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3960,6 +4084,17 @@ static void run_command(void)
         run_elf_validation_demo();
     } else if (command_is("addrspacedemo")) {
         run_address_space_demo();
+    } else if (command_is("run")) {
+        put_string("Usage: run <app>\n");
+    } else if (command_starts_with("run ")) {
+        const char *app_name = command_args_after("run ");
+        if (app_name != 0 && command_is("run hello")) {
+            run_embedded_hello();
+        } else if (app_name != 0) {
+            put_string("Unknown app. Available app: hello\n");
+        } else {
+            put_string("Usage: run <app>\n");
+        }
     } else if (command_is("taskinfo")) {
         show_task_info();
     } else if (command_is("taskdemo")) {
