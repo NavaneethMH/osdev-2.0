@@ -19,6 +19,7 @@
 #define VM_TEST_VIRTUAL_ADDRESS 0x40000000U
 #define USER_CODE_ADDRESS 0x40000000U
 #define USER_STACK_ADDRESS (USER_CODE_ADDRESS + PAGE_SIZE)
+#define USER_ADDRESS_SPACE_DIRECTORY (USER_CODE_ADDRESS >> 22)
 #define SYSCALL_WRITE_MAX 128U
 #define MAX_TASKS 4U
 #define TASK_STACK_SIZE 4096U
@@ -178,6 +179,10 @@ static volatile int keyboard_caps_lock = 0;
 static unsigned int page_directory[1024] __attribute__((aligned(4096)));
 static unsigned int page_tables[PAGE_TABLES_FOR_LIMIT][1024]
     __attribute__((aligned(4096)));
+static unsigned int user_address_space_directory[1024]
+    __attribute__((aligned(4096)));
+static unsigned int user_address_space_table[1024]
+    __attribute__((aligned(4096)));
 static unsigned int dynamic_page_tables[VM_DYNAMIC_TABLES][1024]
     __attribute__((aligned(4096)));
 static unsigned int dynamic_page_table_directory[VM_DYNAMIC_TABLES];
@@ -200,6 +205,8 @@ static volatile int user_protection_fault_seen = 0;
 static volatile int user_demo_active = 0;
 static unsigned int user_code_physical = 0U;
 static unsigned int user_stack_physical = 0U;
+static unsigned int address_space_code_physical = 0U;
+static unsigned int address_space_stack_physical = 0U;
 
 /* Stage 2 task model. The bootstrap task continues on GRUB's stack while
    worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
@@ -1331,6 +1338,137 @@ static void cleanup_user_demo_memory(void)
         (void)release_page(user_code_physical);
         user_code_physical = 0U;
     }
+}
+
+static void load_page_directory(unsigned int *directory)
+{
+    __asm__ volatile ("mov %0, %%cr3" : : "r"((unsigned int)directory) : "memory");
+}
+
+static unsigned int address_space_directory_flags(unsigned int *directory,
+                                                  unsigned int address)
+{
+    return directory[address >> 22] & 0xFFFU;
+}
+
+static unsigned int address_space_page_flags(unsigned int *directory,
+                                             unsigned int address)
+{
+    unsigned int directory_index = address >> 22;
+    unsigned int page_index = (address >> 12) & 0x3FFU;
+    unsigned int entry = directory[directory_index];
+    if ((entry & 0x01U) == 0U) {
+        return 0U;
+    }
+    unsigned int *table = (unsigned int *)(entry & 0xFFFFF000U);
+    return table[page_index] & 0xFFFU;
+}
+
+/* Build a small process address space with a supervisor-only kernel identity
+   map plus one user code page and one user stack page. */
+static int prepare_user_address_space(void)
+{
+    unsigned int blob_start = (unsigned int)user_blob_start;
+    unsigned int blob_end = (unsigned int)user_blob_end;
+    unsigned int blob_size = blob_end - blob_start;
+
+    if (!paging_enabled || !page_allocator_available ||
+        USER_CODE_ADDRESS < PAGING_MAPPED_LIMIT ||
+        USER_ADDRESS_SPACE_DIRECTORY < PAGE_TABLES_FOR_LIMIT ||
+        USER_ADDRESS_SPACE_DIRECTORY >= 1024U ||
+        (USER_CODE_ADDRESS & (PAGE_SIZE - 1U)) != 0U ||
+        (USER_STACK_ADDRESS & (PAGE_SIZE - 1U)) != 0U ||
+        USER_CODE_ADDRESS >> 22 != USER_STACK_ADDRESS >> 22 ||
+        (page_directory[USER_ADDRESS_SPACE_DIRECTORY] & 0x01U) != 0U ||
+        blob_end < blob_start || blob_size == 0U || blob_size > PAGE_SIZE) {
+        return 0;
+    }
+
+    address_space_code_physical = allocate_page();
+    if (address_space_code_physical == 0U) {
+        return 0;
+    }
+    address_space_stack_physical = allocate_page();
+    if (address_space_stack_physical == 0U) {
+        (void)release_page(address_space_code_physical);
+        address_space_code_physical = 0U;
+        return 0;
+    }
+
+    for (unsigned int i = 0U; i < 1024U; ++i) {
+        user_address_space_directory[i] = 0U;
+        user_address_space_table[i] = 0U;
+    }
+    for (unsigned int i = 0U; i < PAGE_TABLES_FOR_LIMIT; ++i) {
+        /* Keep every shared kernel mapping supervisor-only in the process. */
+        user_address_space_directory[i] = page_directory[i] & ~0x04U;
+    }
+
+    clear_physical_page(address_space_code_physical);
+    clear_physical_page(address_space_stack_physical);
+    unsigned char *destination = (unsigned char *)address_space_code_physical;
+    const unsigned char *source = user_blob_start;
+    for (unsigned int i = 0U; i < blob_size; ++i) {
+        destination[i] = source[i];
+    }
+
+    /* Minimal 32-bit process entry stack: argc=0, argv[0]=NULL, envp[0]=NULL. */
+    unsigned int *stack = (unsigned int *)address_space_stack_physical;
+    unsigned int initial_words = PAGE_SIZE / sizeof(unsigned int) - 3U;
+    stack[initial_words] = 0U;
+    stack[initial_words + 1U] = 0U;
+    stack[initial_words + 2U] = 0U;
+
+    unsigned int code_index = (USER_CODE_ADDRESS >> 12) & 0x3FFU;
+    unsigned int stack_index = (USER_STACK_ADDRESS >> 12) & 0x3FFU;
+    user_address_space_table[code_index] = address_space_code_physical | 0x05U;
+    user_address_space_table[stack_index] = address_space_stack_physical | 0x07U;
+    user_address_space_directory[USER_ADDRESS_SPACE_DIRECTORY] =
+        (unsigned int)&user_address_space_table[0] | 0x07U;
+    return 1;
+}
+
+static void cleanup_user_address_space(void)
+{
+    for (unsigned int i = 0U; i < 1024U; ++i) {
+        user_address_space_directory[i] = 0U;
+        user_address_space_table[i] = 0U;
+    }
+    if (address_space_stack_physical != 0U) {
+        (void)release_page(address_space_stack_physical);
+        address_space_stack_physical = 0U;
+    }
+    if (address_space_code_physical != 0U) {
+        (void)release_page(address_space_code_physical);
+        address_space_code_physical = 0U;
+    }
+}
+
+static int user_address_space_permissions_valid(void)
+{
+    unsigned int code_directory = address_space_directory_flags(
+        user_address_space_directory, USER_CODE_ADDRESS);
+    unsigned int stack_directory = address_space_directory_flags(
+        user_address_space_directory, USER_STACK_ADDRESS);
+    unsigned int code_page = address_space_page_flags(
+        user_address_space_directory, USER_CODE_ADDRESS);
+    unsigned int stack_page = address_space_page_flags(
+        user_address_space_directory, USER_STACK_ADDRESS);
+    unsigned int vga_directory = address_space_directory_flags(
+        user_address_space_directory, 0x000B8000U);
+    unsigned int vga_page = address_space_page_flags(
+        user_address_space_directory, 0x000B8000U);
+    unsigned int *stack = (unsigned int *)address_space_stack_physical;
+    unsigned int initial_words = PAGE_SIZE / sizeof(unsigned int) - 3U;
+
+    return (code_directory & 0x05U) == 0x05U &&
+           (stack_directory & 0x07U) == 0x07U &&
+           (code_page & 0x05U) == 0x05U && (code_page & 0x02U) == 0U &&
+           (stack_page & 0x07U) == 0x07U &&
+           (vga_directory & 0x04U) == 0U && (vga_page & 0x05U) == 0x01U &&
+           (page_directory[USER_ADDRESS_SPACE_DIRECTORY] & 0x01U) == 0U &&
+           stack[initial_words] == 0U && stack[initial_words + 1U] == 0U &&
+           stack[initial_words + 2U] == 0U;
 }
 
 static unsigned int kernel_page_flags(unsigned int virtual_address)
@@ -3664,6 +3802,39 @@ static void run_ring3_demo(void)
         : "Ring 3 demo returned without the expected breakpoint.\n");
 }
 
+static void run_address_space_demo(void)
+{
+    if (!prepare_user_address_space()) {
+        put_string("Could not create the separate user address space.\n");
+        return;
+    }
+    if (!user_address_space_permissions_valid()) {
+        cleanup_user_address_space();
+        put_string("Address-space permission or initial-stack check failed.\n");
+        return;
+    }
+
+    put_string("User address space: separate page directory loaded for the demo.\n");
+    put_string("User code: user/read-only; user stack: user/read-write.\n");
+    put_string("Kernel VGA mapping: supervisor-only; kernel address space has no user mappings.\n");
+    put_string("Initial stack: argc=0, argv=NULL, envp=NULL.\n");
+
+    ring3_demo_trap_seen = 0;
+    ring3_demo_active = 1;
+    load_page_directory(user_address_space_directory);
+    enter_user_mode(USER_CODE_ADDRESS +
+                        ((unsigned int)ring3_demo_user -
+                         (unsigned int)user_blob_start),
+                    USER_STACK_ADDRESS + PAGE_SIZE - 3U * sizeof(unsigned int));
+    load_page_directory(page_directory);
+    ring3_demo_active = 0;
+    cleanup_user_address_space();
+    __asm__ volatile ("sti");
+    put_string(ring3_demo_trap_seen != 0
+        ? "Address-space demo passed: ring 3 returned safely to the kernel.\n"
+        : "Address-space demo failed: user code did not return as expected.\n");
+}
+
 static void run_syscall_demo(void)
 {
     if (paging_enabled == 0) {
@@ -3771,7 +3942,7 @@ static void run_elf_validation_demo(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3787,6 +3958,8 @@ static void run_command(void)
         run_user_protection_demo();
     } else if (command_is("elfdemo")) {
         run_elf_validation_demo();
+    } else if (command_is("addrspacedemo")) {
+        run_address_space_demo();
     } else if (command_is("taskinfo")) {
         show_task_info();
     } else if (command_is("taskdemo")) {
