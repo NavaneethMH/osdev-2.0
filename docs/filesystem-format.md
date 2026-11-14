@@ -33,6 +33,8 @@ TinyOS recognizes versions 1, 2, 3, and 4. Versions 1-3 use fixed data slots and
 
 The current kernel constant is `FILESYSTEM_VERSION` in `kernel.c`. Increase the version when an incompatible on-disk layout or interpretation changes, and add an explicit reader/migration path when old disks should remain usable. Do not silently reinterpret an existing version.
 
+At startup, invalid metadata or file chains keep the file store unavailable. Version 4 orphaned allocations are preserved instead of being silently discarded; `fsck` can inspect the disk, and `fsck repair` previews cleanup before the user confirms it with `fsck repair confirm`. Before a normal file command runs, TinyOS audits the directory, FAT, chains, and file data and refuses the operation if the on-disk state differs from the checked in-memory state. A disk I/O error during a metadata transaction disables file commands for the rest of that boot when the on-disk result may be uncertain.
+
 ## Directory table
 
 LBA 1 contains 16 records, each 32 bytes. Integer fields are little-endian. A record has this layout:
@@ -62,10 +64,12 @@ The FAT occupies 16 sectors (8,192 bytes) at LBAs 130-145. Entries are unsigned 
 
 Cluster `n` maps to disk LBA `146 + n`. Each cluster is one 512-byte sector. A nonempty file needs `ceil(length / 512)` clusters; unused bytes at the end of its final sector are zero-filled. Empty files and directories have no clusters. TinyOS limits each file to 32,768 text bytes (64 sectors), even though the disk has more free clusters.
 
+With 16 directory entries and a 64-cluster per-file limit, normal files can currently use at most 1,024 data clusters combined. The allocator rejects a request that cannot fit in the available free clusters without committing the new directory entry. `fsbounds` exercises the no-free-cluster path against a temporary in-memory FAT image, plus invalid filesystem cluster requests and out-of-range disk reads and writes; it does not modify the disk.
+
 ## Legacy fixed-slot data
 
 Versions 1-3 store a file's first 512-byte chunk at LBA `2 + entry_index`. Remaining chunks use LBAs `18 + entry_index * 7 + (chunk_index - 1)`, for up to eight sectors per file. Version 4 does not read or write these fixed slots after migration; it follows each file's cluster chain instead.
 
 ## VM inspection
 
-At the TinyOS prompt, `fsinfo` prints the active format version and the principal sector ranges. `fscheck <file>` checks a file's metadata, cluster chain, and contents. `fsck` audits the directory, allocation table, chains, and file data. Keep the existing VDI attached when rebooting to verify persistence; use a disposable disk image when experimenting with format migration or corruption recovery.
+At the TinyOS prompt, `fsinfo` prints the active format version and the principal sector ranges. `fscheck <file>` checks a file's metadata, cluster chain, and contents. `fsck` audits the directory, allocation table, chains, and file data, including when startup has disabled normal file commands. Keep the existing VDI attached when rebooting to verify persistence; use a disposable disk image when experimenting with format migration or corruption recovery.
