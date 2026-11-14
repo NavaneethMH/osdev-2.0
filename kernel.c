@@ -313,6 +313,7 @@ static struct file_entry files[MAX_FILES];
 /* Shared transaction backup avoids large per-command stack allocations. */
 static struct file_entry file_entry_backup;
 static unsigned short filesystem_fat[FILESYSTEM_FAT_ENTRIES];
+static unsigned short filesystem_fat_backup[FILESYSTEM_FAT_ENTRIES];
 static unsigned char filesystem_fat_disk[FILESYSTEM_FAT_SECTORS * DISK_SECTOR_SIZE];
 static unsigned char filesystem_scan_buffer[DISK_SECTOR_SIZE * 32U];
 static char filesystem_write_buffer[FILE_CONTENT_MAX + 1U];
@@ -320,6 +321,7 @@ static unsigned char filesystem_cluster_seen[FILESYSTEM_CLUSTER_COUNT];
 static int file_store_ready = 0;
 static int file_store_error = 0;
 static unsigned char current_directory = FILE_PARENT_ROOT;
+static void report_file_store_unavailable(void);
 
 /* I/O port functions */
 static void outb(unsigned short port, unsigned char value)
@@ -1723,6 +1725,22 @@ static unsigned int string_length(const char *s)
     return len;
 }
 
+static int filesystem_bounded_content_length(const char *content,
+                                              unsigned int *length)
+{
+    if (content == 0 || length == 0) {
+        return 0;
+    }
+    for (unsigned int i = 0; i <= FILE_CONTENT_MAX; ++i) {
+        if (content[i] == '\0') {
+            *length = i;
+            return 1;
+        }
+    }
+    *length = 0U;
+    return 0;
+}
+
 static int strings_equal(const char *a, const char *b)
 {
     while (*a != '\0' && *b != '\0') {
@@ -1832,6 +1850,14 @@ static int filesystem_load_fat(void)
 static int filesystem_write_fat(void)
 {
     for (unsigned int i = 0; i < FILESYSTEM_FAT_ENTRIES; ++i) {
+        if ((i < FILESYSTEM_CLUSTER_COUNT &&
+             filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE &&
+             filesystem_fat[i] != FILESYSTEM_CLUSTER_END &&
+             filesystem_fat[i] >= FILESYSTEM_CLUSTER_COUNT) ||
+            (i >= FILESYSTEM_CLUSTER_COUNT &&
+             filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE)) {
+            return FILESYSTEM_CORRUPT_ERROR;
+        }
         filesystem_fat_disk[i * 2U] =
             (unsigned char)(filesystem_fat[i] & 0xFFU);
         filesystem_fat_disk[i * 2U + 1U] =
@@ -1847,7 +1873,7 @@ static int filesystem_allocate_chain(unsigned int count,
                                      unsigned short *first_cluster)
 {
     unsigned short allocated[FILESYSTEM_MAX_FILE_SECTORS];
-    if (count > FILESYSTEM_MAX_FILE_SECTORS) {
+    if (first_cluster == 0 || count > FILESYSTEM_MAX_FILE_SECTORS) {
         return FILESYSTEM_CORRUPT_ERROR;
     }
     *first_cluster = FILESYSTEM_CLUSTER_FREE;
@@ -1894,6 +1920,11 @@ static int filesystem_release_chain(unsigned short first_cluster,
             filesystem_fat[cluster] == FILESYSTEM_CLUSTER_FREE) {
             return FILESYSTEM_CORRUPT_ERROR;
         }
+        for (unsigned int prior = 0U; prior < i; ++prior) {
+            if (chain[prior] == cluster) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+        }
         chain[i] = cluster;
         unsigned short next = filesystem_fat[cluster];
         if (i + 1U == count) {
@@ -1919,14 +1950,53 @@ static int filesystem_write_data_chain(unsigned short first_cluster,
                                        unsigned int sector_count,
                                        const char *content)
 {
-    unsigned int length = string_length(content);
-    unsigned int offset = 0U;
+    unsigned int length;
+    unsigned int expected_count;
+    unsigned short chain[FILESYSTEM_MAX_FILE_SECTORS];
+    if (!filesystem_bounded_content_length(content, &length) ||
+        length > FILE_CONTENT_MAX) {
+        return FILESYSTEM_CORRUPT_ERROR;
+    }
+    expected_count = length == 0U ? 0U :
+        (length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
+    if (sector_count != expected_count ||
+        sector_count > FILESYSTEM_MAX_FILE_SECTORS ||
+        (sector_count == 0U && first_cluster != FILESYSTEM_CLUSTER_FREE) ||
+        (sector_count != 0U && first_cluster >= FILESYSTEM_CLUSTER_COUNT)) {
+        return FILESYSTEM_CORRUPT_ERROR;
+    }
+
+    /* Validate the full chain before writing any data sector. */
     unsigned short cluster = first_cluster;
-    for (unsigned int file_sector = 0; file_sector < sector_count; ++file_sector) {
+    for (unsigned int i = 0U; i < sector_count; ++i) {
         if (cluster >= FILESYSTEM_CLUSTER_COUNT ||
             filesystem_fat[cluster] == FILESYSTEM_CLUSTER_FREE) {
             return FILESYSTEM_CORRUPT_ERROR;
         }
+        for (unsigned int prior = 0U; prior < i; ++prior) {
+            if (chain[prior] == cluster) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+        }
+        chain[i] = cluster;
+        unsigned short next = filesystem_fat[cluster];
+        if (i + 1U == sector_count) {
+            if (next != FILESYSTEM_CLUSTER_END) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+        } else {
+            if (next == FILESYSTEM_CLUSTER_END ||
+                next == FILESYSTEM_CLUSTER_FREE ||
+                next >= FILESYSTEM_CLUSTER_COUNT) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+            cluster = next;
+        }
+    }
+
+    unsigned int offset = 0U;
+    for (unsigned int file_sector = 0; file_sector < sector_count; ++file_sector) {
+        cluster = chain[file_sector];
         for (unsigned int i = 0; i < DISK_SECTOR_SIZE; ++i) {
             filesystem_fat_disk[i] = 0U;
         }
@@ -1943,13 +2013,6 @@ static int filesystem_write_data_chain(unsigned short first_cluster,
             return result;
         }
         offset += bytes_here;
-        if (file_sector + 1U < sector_count) {
-            unsigned short next = filesystem_fat[cluster];
-            if (next == FILESYSTEM_CLUSTER_END || next >= FILESYSTEM_CLUSTER_COUNT) {
-                return FILESYSTEM_CORRUPT_ERROR;
-            }
-            cluster = next;
-        }
     }
     return 0;
 }
@@ -1959,12 +2022,52 @@ static int filesystem_read_data_chain(unsigned short first_cluster,
                                       unsigned int length,
                                       char *content)
 {
-    unsigned int offset = 0U;
+    unsigned int expected_count;
+    unsigned short chain[FILESYSTEM_MAX_FILE_SECTORS];
+    if (content == 0 || length > FILE_CONTENT_MAX) {
+        return FILESYSTEM_CORRUPT_ERROR;
+    }
+    expected_count = length == 0U ? 0U :
+        (length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
+    if (sector_count != expected_count ||
+        sector_count > FILESYSTEM_MAX_FILE_SECTORS ||
+        (sector_count == 0U && first_cluster != FILESYSTEM_CLUSTER_FREE) ||
+        (sector_count != 0U && first_cluster >= FILESYSTEM_CLUSTER_COUNT)) {
+        return FILESYSTEM_CORRUPT_ERROR;
+    }
+
+    /* Validate the entire chain before reading any sectors into the file. */
     unsigned short cluster = first_cluster;
-    for (unsigned int file_sector = 0; file_sector < sector_count; ++file_sector) {
+    for (unsigned int i = 0U; i < sector_count; ++i) {
         if (cluster >= FILESYSTEM_CLUSTER_COUNT ||
-            filesystem_fat[cluster] == FILESYSTEM_CLUSTER_FREE ||
-            filesystem_cluster_seen[cluster]) {
+            filesystem_fat[cluster] == FILESYSTEM_CLUSTER_FREE) {
+            return FILESYSTEM_CORRUPT_ERROR;
+        }
+        for (unsigned int prior = 0U; prior < i; ++prior) {
+            if (chain[prior] == cluster) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+        }
+        chain[i] = cluster;
+        unsigned short next = filesystem_fat[cluster];
+        if (i + 1U == sector_count) {
+            if (next != FILESYSTEM_CLUSTER_END) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+        } else {
+            if (next == FILESYSTEM_CLUSTER_END ||
+                next == FILESYSTEM_CLUSTER_FREE ||
+                next >= FILESYSTEM_CLUSTER_COUNT) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+            cluster = next;
+        }
+    }
+
+    unsigned int offset = 0U;
+    for (unsigned int file_sector = 0; file_sector < sector_count; ++file_sector) {
+        cluster = chain[file_sector];
+        if (filesystem_cluster_seen[cluster]) {
             return FILESYSTEM_CORRUPT_ERROR;
         }
         filesystem_cluster_seen[cluster] = 1U;
@@ -1983,21 +2086,12 @@ static int filesystem_read_data_chain(unsigned short first_cluster,
             }
             content[offset + i] = (char)filesystem_fat_disk[i];
         }
-        offset += bytes_here;
-
-        unsigned short next = filesystem_fat[cluster];
-        if (file_sector + 1U == sector_count) {
-            if (next != FILESYSTEM_CLUSTER_END) {
+        for (unsigned int i = bytes_here; i < DISK_SECTOR_SIZE; ++i) {
+            if (filesystem_fat_disk[i] != 0U) {
                 return FILESYSTEM_CORRUPT_ERROR;
             }
-        } else {
-            if (next == FILESYSTEM_CLUSTER_END ||
-                next == FILESYSTEM_CLUSTER_FREE ||
-                next >= FILESYSTEM_CLUSTER_COUNT) {
-                return FILESYSTEM_CORRUPT_ERROR;
-            }
-            cluster = next;
         }
+        offset += bytes_here;
     }
     content[length] = '\0';
     return 0;
@@ -2035,6 +2129,11 @@ static int filesystem_write_directory(void)
         if (!files[slot].used) {
             continue;
         }
+        if (files[slot].used != 1 ||
+            (files[slot].is_directory != 0 &&
+             files[slot].is_directory != 1)) {
+            return FILESYSTEM_CORRUPT_ERROR;
+        }
         if (!file_name_valid(files[slot].name)) {
             return FILESYSTEM_CORRUPT_ERROR;
         }
@@ -2045,8 +2144,21 @@ static int filesystem_write_directory(void)
              files[slot].parent == slot)) {
             return FILESYSTEM_CORRUPT_ERROR;
         }
-        unsigned int content_length = files[slot].is_directory
-            ? 0U : string_length(files[slot].content);
+        unsigned int ancestor = files[slot].parent;
+        for (unsigned int depth = 0U; ancestor != FILE_PARENT_ROOT; ++depth) {
+            if (depth >= MAX_FILES || ancestor >= MAX_FILES ||
+                !files[ancestor].used || !files[ancestor].is_directory ||
+                ancestor == slot) {
+                return FILESYSTEM_CORRUPT_ERROR;
+            }
+            ancestor = files[ancestor].parent;
+        }
+        unsigned int content_length = 0U;
+        if (!files[slot].is_directory &&
+            !filesystem_bounded_content_length(files[slot].content,
+                                               &content_length)) {
+            return FILESYSTEM_CORRUPT_ERROR;
+        }
         if (content_length > FILE_CONTENT_MAX) {
             return FILESYSTEM_CORRUPT_ERROR;
         }
@@ -2097,12 +2209,19 @@ static int filesystem_write_directory(void)
 static int filesystem_save_change(unsigned int slot,
                                   const struct file_entry *previous)
 {
+    if (slot >= MAX_FILES || previous == 0 || previous == &files[slot]) {
+        return FILESYSTEM_CORRUPT_ERROR;
+    }
     int new_is_file = files[slot].used && !files[slot].is_directory;
     int old_is_file = previous->used && !previous->is_directory;
     int result;
 
     if (new_is_file) {
-        unsigned int length = string_length(files[slot].content);
+        unsigned int length;
+        if (!filesystem_bounded_content_length(files[slot].content, &length)) {
+            file_entry_copy(&files[slot], previous);
+            return FILESYSTEM_CORRUPT_ERROR;
+        }
         unsigned int count = length == 0U ? 0U :
             (length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
         unsigned short first;
@@ -2124,6 +2243,8 @@ static int filesystem_save_change(unsigned int slot,
             if (result < 0) {
                 (void)filesystem_release_chain(first, count);
                 file_entry_copy(&files[slot], previous);
+                file_store_ready = 0;
+                file_store_error = result;
                 return result;
             }
         }
@@ -2138,6 +2259,8 @@ static int filesystem_save_change(unsigned int slot,
         }
         file_entry_copy(&files[slot], previous);
         (void)filesystem_write_directory();
+        file_store_ready = 0;
+        file_store_error = result;
         return result;
     }
 
@@ -2145,10 +2268,14 @@ static int filesystem_save_change(unsigned int slot,
         result = filesystem_release_chain(previous->first_cluster,
                                           previous->cluster_count);
         if (result < 0) {
+            file_store_ready = 0;
+            file_store_error = result;
             return result;
         }
         result = filesystem_write_fat();
         if (result < 0) {
+            file_store_ready = 0;
+            file_store_error = result;
             return result;
         }
     }
@@ -2160,10 +2287,15 @@ static int filesystem_save_change(unsigned int slot,
 static int filesystem_save_metadata_change(unsigned int slot,
                                            const struct file_entry *previous)
 {
+    if (slot >= MAX_FILES || previous == 0 || previous == &files[slot]) {
+        return FILESYSTEM_CORRUPT_ERROR;
+    }
     int result = filesystem_write_directory();
     if (result < 0) {
         file_entry_copy(&files[slot], previous);
         (void)filesystem_write_directory();
+        file_store_ready = 0;
+        file_store_error = result;
         return result;
     }
     return 0;
@@ -2287,6 +2419,14 @@ static int initialize_file_store(void)
         unsigned int offset = slot * FILESYSTEM_ENTRY_SIZE;
         unsigned char used = directory[offset + 18U];
         if (used == 0U) {
+            if (version == FILESYSTEM_VERSION) {
+                for (unsigned int byte = 0U; byte < FILESYSTEM_ENTRY_SIZE; ++byte) {
+                    if (directory[offset + byte] != 0U) {
+                        file_store_error = FILESYSTEM_CORRUPT_ERROR;
+                        return file_store_error;
+                    }
+                }
+            }
             continue;
         }
         if (used != 1U) {
@@ -2330,6 +2470,24 @@ static int initialize_file_store(void)
         files[slot].parent = parent;
         files[slot].content[0] = '\0';
         if (version == FILESYSTEM_VERSION) {
+            for (unsigned int i = 0U; i <= FILENAME_MAX_LEN; ++i) {
+                if (name[i] == '\0') {
+                    for (unsigned int padding = i + 1U;
+                         padding <= FILENAME_MAX_LEN; ++padding) {
+                        if (directory[offset + padding] != 0U) {
+                            file_store_error = FILESYSTEM_CORRUPT_ERROR;
+                            return file_store_error;
+                        }
+                    }
+                    break;
+                }
+            }
+            for (unsigned int byte = 25U; byte < FILESYSTEM_ENTRY_SIZE; ++byte) {
+                if (directory[offset + byte] != 0U) {
+                    file_store_error = FILESYSTEM_CORRUPT_ERROR;
+                    return file_store_error;
+                }
+            }
             files[slot].first_cluster =
                 (unsigned short)directory[offset + 21U] |
                 ((unsigned short)directory[offset + 22U] << 8);
@@ -2439,7 +2597,12 @@ static int initialize_file_store(void)
             if (!files[slot].used || files[slot].is_directory) {
                 continue;
             }
-            unsigned int length = string_length(files[slot].content);
+            unsigned int length;
+            if (!filesystem_bounded_content_length(files[slot].content,
+                                                   &length)) {
+                file_store_error = FILESYSTEM_CORRUPT_ERROR;
+                return file_store_error;
+            }
             unsigned int count = length == 0U ? 0U :
                 (length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
             unsigned short first;
@@ -2476,22 +2639,17 @@ static int initialize_file_store(void)
             return result;
         }
     } else {
-        /* Reclaim clusters orphaned by an interrupted create, rewrite, or rm.
-           All live chains were checked and marked while loading directory data. */
+        /* Preserve unreferenced data until the user reviews it with fsck. */
         int found_orphan = 0;
         for (unsigned int i = 0; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
             if (filesystem_fat[i] != FILESYSTEM_CLUSTER_FREE &&
                 !filesystem_cluster_seen[i]) {
-                filesystem_fat[i] = FILESYSTEM_CLUSTER_FREE;
                 found_orphan = 1;
             }
         }
         if (found_orphan) {
-            result = filesystem_write_fat();
-            if (result < 0) {
-                file_store_error = result;
-                return result;
-            }
+            file_store_error = FILESYSTEM_CORRUPT_ERROR;
+            return file_store_error;
         }
     }
 
@@ -2535,8 +2693,14 @@ static void show_filesystem_space(void)
 
 static void inspect_file_chain(unsigned int slot)
 {
-    const struct file_entry *file = &files[slot];
-    unsigned int length = string_length(file->content);
+    const struct file_entry *file;
+    unsigned int length;
+    if (slot >= MAX_FILES || !files[slot].used ||
+        !filesystem_bounded_content_length(files[slot].content, &length)) {
+        put_string("Filesystem check failed: invalid file entry or unterminated content.\n");
+        return;
+    }
+    file = &files[slot];
     unsigned int expected_count = length == 0U ? 0U :
         (length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
     int result = disk_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U,
@@ -2695,7 +2859,12 @@ static void inspect_file_chain(unsigned int slot)
         if (other == slot || !files[other].used || files[other].is_directory) {
             continue;
         }
-        unsigned int other_length = string_length(files[other].content);
+        unsigned int other_length;
+        if (!filesystem_bounded_content_length(files[other].content,
+                                               &other_length)) {
+            put_string("\nFilesystem check failed: another file has unterminated content.\n");
+            return;
+        }
         unsigned int other_count = other_length == 0U ? 0U :
             (other_length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
         if (files[other].cluster_count != other_count ||
@@ -2787,19 +2956,6 @@ static unsigned char filesystem_expected_entry_byte(unsigned int slot,
         case 24U: return (unsigned char)(file->cluster_count >> 8);
         default: return 0U;
     }
-}
-
-static int filesystem_bounded_content_length(const char *content,
-                                              unsigned int *length)
-{
-    for (unsigned int i = 0; i <= FILE_CONTENT_MAX; ++i) {
-        if (content[i] == '\0') {
-            *length = i;
-            return 1;
-        }
-    }
-    *length = 0U;
-    return 0;
 }
 
 static void filesystem_run_audit(struct filesystem_audit_summary *summary)
@@ -3136,9 +3292,102 @@ static void run_filesystem_repair_preview(int confirm)
         }
         return;
     }
+    file_store_ready = 1;
+    file_store_error = 0;
     put_string("Repair complete: reclaimed ");
     put_unsigned(reclaimed);
     put_string(" unreferenced clusters; file contents were not changed.\n");
+}
+
+static int filesystem_command_needs_audit(void)
+{
+    return command_is("ls") || command_is("pwd") || command_is("df") ||
+           command_is("fsbounds") ||
+           command_is("install hello") || command_is("run") ||
+           command_starts_with("run ") || command_starts_with("mkdir ") ||
+           command_starts_with("cd ") || command_starts_with("rmdir ") ||
+           command_starts_with("touch ") || command_starts_with("write ") ||
+           command_starts_with("cat ") || command_starts_with("rm ") ||
+           command_is("rename") || command_starts_with("rename ") ||
+           command_is("cp") || command_starts_with("cp ");
+}
+
+static int filesystem_preflight_audit(void)
+{
+    struct filesystem_audit_summary summary;
+    filesystem_run_audit(&summary);
+    if (!summary.scan_complete || summary.errors != 0U ||
+        summary.orphans != 0U) {
+        show_filesystem_audit_summary(&summary);
+        put_string("Operation refused: filesystem is not clean; inspect with fsck.\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void run_filesystem_bounds_demo(void)
+{
+    if (!file_store_ready) {
+        report_file_store_unavailable();
+        return;
+    }
+
+    for (unsigned int i = 0U; i < FILESYSTEM_FAT_ENTRIES; ++i) {
+        filesystem_fat_backup[i] = filesystem_fat[i];
+    }
+    for (unsigned int i = 0U; i < FILESYSTEM_CLUSTER_COUNT; ++i) {
+        filesystem_fat[i] = FILESYSTEM_CLUSTER_END;
+    }
+
+    unsigned short first = FILESYSTEM_CLUSTER_FREE;
+    int full_result = filesystem_allocate_chain(1U, &first);
+    int too_many_result = filesystem_allocate_chain(
+        FILESYSTEM_MAX_FILE_SECTORS + 1U, &first);
+    int null_result = filesystem_allocate_chain(1U, 0);
+    int bad_write_result = filesystem_write_data_chain(
+        (unsigned short)FILESYSTEM_CLUSTER_COUNT, 1U, "x");
+    char read_buffer[2];
+    int bad_read_result = filesystem_read_data_chain(
+        (unsigned short)FILESYSTEM_CLUSTER_COUNT, 1U, 1U, read_buffer);
+    unsigned char io_probe[DISK_SECTOR_SIZE];
+    for (unsigned int i = 0U; i < DISK_SECTOR_SIZE; ++i) {
+        io_probe[i] = 0U;
+    }
+    unsigned int disk_sectors = disk_sector_count();
+    int bad_lba_read = disk_read_sectors(disk_sectors, 1U, io_probe);
+    int bad_lba_write = disk_write_sectors(disk_sectors, 1U, io_probe);
+    int zero_count_read = disk_read_sectors(0U, 0U, io_probe);
+
+    for (unsigned int i = 0U; i < FILESYSTEM_FAT_ENTRIES; ++i) {
+        filesystem_fat[i] = filesystem_fat_backup[i];
+    }
+
+    if (full_result == FILESYSTEM_FULL_ERROR &&
+        too_many_result == FILESYSTEM_CORRUPT_ERROR &&
+        null_result == FILESYSTEM_CORRUPT_ERROR &&
+        bad_write_result == FILESYSTEM_CORRUPT_ERROR &&
+        bad_read_result == FILESYSTEM_CORRUPT_ERROR &&
+        bad_lba_read < 0 && bad_lba_write < 0 && zero_count_read < 0) {
+        put_string("Filesystem bounds demo passed: full allocation and invalid filesystem/disk read-write bounds were rejected; disk data was untouched.\n");
+    } else {
+        put_string("Filesystem bounds demo failed: full=");
+        put_hex32((unsigned int)full_result);
+        put_string(" oversized=");
+        put_hex32((unsigned int)too_many_result);
+        put_string(" null=");
+        put_hex32((unsigned int)null_result);
+        put_string(" bad-write=");
+        put_hex32((unsigned int)bad_write_result);
+        put_string(" bad-read=");
+        put_hex32((unsigned int)bad_read_result);
+        put_string(" bad-LBA-read=");
+        put_hex32((unsigned int)bad_lba_read);
+        put_string(" bad-LBA-write=");
+        put_hex32((unsigned int)bad_lba_write);
+        put_string(" zero-count=");
+        put_hex32((unsigned int)zero_count_read);
+        put_char('\n');
+    }
 }
 
 /* --- End file store helpers --- */
@@ -4022,7 +4271,12 @@ static void run_stored_application(const char *app_name)
         return;
     }
 
-    unsigned int encoded_size = string_length(files[slot].content);
+    unsigned int encoded_size;
+    if (!filesystem_bounded_content_length(files[slot].content,
+                                           &encoded_size)) {
+        put_string("Stored app has unterminated or oversized content.\n");
+        return;
+    }
     if (encoded_size == 0U || (encoded_size & 1U) != 0U ||
         encoded_size / 2U > sizeof(app_image_buffer)) {
         put_string("Stored app is empty or has an invalid hex encoding.\n");
@@ -4245,13 +4499,21 @@ static void run_elf_validation_demo(void)
 
 static void run_command(void)
 {
+    if (file_store_ready && filesystem_command_needs_audit() &&
+        !filesystem_preflight_audit()) {
+        command_length = 0U;
+        command[0] = '\0';
+        show_prompt();
+        return;
+    }
+
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello, run <app>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello, run <app>\n");
         put_string("Apps: install hello saves the ISO sample app to persistent storage; run <name> loads <name>.elf from the current directory.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
-        put_string("       fsck checks the full filesystem; fsck repair previews orphan cleanup.\n");
+        put_string("       fsck checks the full filesystem; fsck repair previews orphan cleanup; fsbounds checks full-disk and invalid-bound handling without disk writes.\n");
         put_string("Files persist on disk; 16 entries, 15-char names, up to 32768 chars per file.\n");
         put_string("Disk space is shared dynamically; remove or shrink files to free clusters.\n");
         put_string("Type a command and press Enter.\n");
@@ -4318,6 +4580,8 @@ static void run_command(void)
         show_filesystem_info();
     } else if (command_is("disktest")) {
         run_disk_test();
+    } else if (command_is("fsbounds")) {
+        run_filesystem_bounds_demo();
     } else if (command_is("df")) {
         if (!file_store_ready) {
             report_file_store_unavailable();
@@ -4343,23 +4607,11 @@ static void run_command(void)
             }
         }
     } else if (command_is("fsck repair confirm")) {
-        if (!file_store_ready) {
-            report_file_store_unavailable();
-        } else {
-            run_filesystem_repair_preview(1);
-        }
+        run_filesystem_repair_preview(1);
     } else if (command_is("fsck repair")) {
-        if (!file_store_ready) {
-            report_file_store_unavailable();
-        } else {
-            run_filesystem_repair_preview(0);
-        }
+        run_filesystem_repair_preview(0);
     } else if (command_is("fsck")) {
-        if (!file_store_ready) {
-            report_file_store_unavailable();
-        } else {
-            run_filesystem_check();
-        }
+        run_filesystem_check();
     } else if (command_starts_with("fsck ")) {
         put_string("Usage: fsck, fsck repair, or fsck repair confirm\n");
     } else if (command_is("alloc")) {
