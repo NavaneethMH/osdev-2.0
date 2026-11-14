@@ -3,7 +3,6 @@
 #define ELF32_HEADER_SIZE 52U
 #define ELF32_PROGRAM_HEADER_SIZE 32U
 #define ELF32_MAX_PROGRAM_HEADERS 32U
-#define ELF32_MAX_LOAD_SEGMENTS 16U
 #define ELF32_USER_MIN 0x00400000U
 #define ELF32_USER_MAX 0xC0000000U
 
@@ -63,6 +62,18 @@ enum elf32_result elf32_validate(const unsigned char *image,
 
     if (image == 0 || info == 0) {
         return ELF32_BAD_ARGUMENT;
+    }
+    info->entry = 0U;
+    info->load_segment_count = 0U;
+    info->lowest_address = 0U;
+    info->highest_address = 0U;
+    for (unsigned int i = 0U; i < ELF32_MAX_LOAD_SEGMENTS; ++i) {
+        info->segments[i].offset = 0U;
+        info->segments[i].virtual_address = 0U;
+        info->segments[i].file_size = 0U;
+        info->segments[i].memory_size = 0U;
+        info->segments[i].flags = 0U;
+        info->segments[i].alignment = 0U;
     }
     if (image_size < ELF32_HEADER_SIZE) {
         return ELF32_TRUNCATED_HEADER;
@@ -128,6 +139,12 @@ enum elf32_result elf32_validate(const unsigned char *image,
             ranges[load_count].start = vaddr;
             ranges[load_count].end = end;
             ranges[load_count].flags = flags;
+            info->segments[load_count].offset = offset;
+            info->segments[load_count].virtual_address = vaddr;
+            info->segments[load_count].file_size = filesz;
+            info->segments[load_count].memory_size = memsz;
+            info->segments[load_count].flags = flags;
+            info->segments[load_count].alignment = align;
             for (unsigned int j = 0U; j < load_count; ++j) {
                 if (vaddr < ranges[j].end && ranges[j].start < end) {
                     return ELF32_OVERLAPPING_SEGMENTS;
