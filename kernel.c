@@ -10,6 +10,7 @@
 #define PAGE_SIZE 4096U
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002U
 #define MULTIBOOT_INFO_MEMORY 0x00000001U
+#define MULTIBOOT_INFO_MODULES 0x00000008U
 #define MULTIBOOT_INFO_MEMORY_MAP 0x00000040U
 #define MAX_MEMORY_REGIONS 32U
 #define MAX_TRACKED_PAGES 256U
@@ -27,6 +28,7 @@
 #define MAX_FILES 16U
 #define FILENAME_MAX_LEN 15U
 #define FILE_CONTENT_MAX 32768U
+#define BOOT_APP_MAX_SIZE (FILE_CONTENT_MAX / 2U)
 #define COMMAND_MAX (FILE_CONTENT_MAX + FILENAME_MAX_LEN + 9U)
 #define FILESYSTEM_SUPER_LBA 0U
 #define FILESYSTEM_DIRECTORY_LBA 1U
@@ -67,6 +69,13 @@ struct multiboot_info {
     unsigned int symbols[4];
     unsigned int mmap_length;
     unsigned int mmap_addr;
+};
+
+struct multiboot_module {
+    unsigned int start;
+    unsigned int end;
+    unsigned int string;
+    unsigned int reserved;
 };
 
 struct multiboot_mmap_entry {
@@ -132,8 +141,6 @@ extern void ring3_demo_return_trampoline(void);
 extern void syscall128(void);
 extern unsigned char user_blob_start[];
 extern unsigned char user_blob_end[];
-extern unsigned char _binary_build_hello_elf_start[];
-extern unsigned char _binary_build_hello_elf_end[];
 extern void ring3_syscall_demo_user(void);
 extern void ring3_protection_demo_user(void);
 extern unsigned char ring3_syscall_message[];
@@ -208,11 +215,14 @@ static volatile int user_demo_active = 0;
 static volatile int embedded_app_active = 0;
 static volatile int embedded_app_exit_seen = 0;
 static volatile unsigned int embedded_app_exit_status = 0xFFFFFFFFU;
-static unsigned int *active_user_address_space = 0;
 static unsigned int user_code_physical = 0U;
 static unsigned int user_stack_physical = 0U;
 static unsigned int address_space_code_physical = 0U;
 static unsigned int address_space_stack_physical = 0U;
+static unsigned int *active_user_address_space = 0;
+static unsigned char boot_app_image[BOOT_APP_MAX_SIZE];
+static unsigned int boot_app_image_size = 0U;
+static unsigned char app_image_buffer[BOOT_APP_MAX_SIZE];
 
 /* Stage 2 task model. The bootstrap task continues on GRUB's stack while
    worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
@@ -1175,6 +1185,7 @@ static int syscall_user_buffer_readable(unsigned int address,
         address > 0xFFFFFFFFU - (length - 1U)) {
         return 0;
     }
+
     unsigned int last = address + length - 1U;
     unsigned int page = address & ~(PAGE_SIZE - 1U);
     unsigned int last_page = last & ~(PAGE_SIZE - 1U);
@@ -1187,12 +1198,17 @@ static int syscall_user_buffer_readable(unsigned int address,
         unsigned int directory_flags = directory_entry & 0xFFFU;
         unsigned int page_flags = 0U;
         if ((directory_entry & 0x01U) != 0U) {
-            unsigned int *table = (unsigned int *)(directory_entry & 0xFFFFF000U);
+            unsigned int *table =
+                (unsigned int *)(directory_entry & 0xFFFFF000U);
             page_flags = table[page_index] & 0xFFFU;
         }
         if ((directory_flags & 0x05U) != 0x05U ||
-            (page_flags & 0x05U) != 0x05U) return 0;
-        if (page == last_page) return 1;
+            (page_flags & 0x05U) != 0x05U) {
+            return 0;
+        }
+        if (page == last_page) {
+            return 1;
+        }
         page += PAGE_SIZE;
     }
 }
@@ -3480,10 +3496,12 @@ void syscall_handler(struct syscall_cpu_frame *frame)
                     syscall_demo_large_buffer_seen = 1;
                 }
             }
+
             if (!syscall_user_buffer_readable(frame->ebx, frame->ecx)) {
                 frame->eax = 0xFFFFFFFFU;
                 break;
             }
+
             const unsigned char *message =
                 (const unsigned char *)frame->ebx;
             for (unsigned int i = 0; i < frame->ecx; ++i) {
@@ -3524,6 +3542,7 @@ void syscall_handler(struct syscall_cpu_frame *frame)
             break;
     }
 }
+
 static void show_prompt(void)
 {
     put_string("tinyos> ");
@@ -3856,9 +3875,8 @@ static void run_address_space_demo(void)
         : "Address-space demo failed: user code did not return as expected.\n");
 }
 
-/* Load the milestone's small embedded ELF into the dedicated user window.
-   General multi-page loading and filesystem-backed executables are later work. */
-static int prepare_embedded_hello_address_space(
+/* Load a small ELF from the persistent file store into the user window. */
+static int prepare_user_elf_address_space(
     const unsigned char *image,
     const struct elf32_image_info *info)
 {
@@ -3881,7 +3899,9 @@ static int prepare_embedded_hello_address_space(
     }
 
     address_space_code_physical = allocate_page();
-    if (address_space_code_physical == 0U) return 0;
+    if (address_space_code_physical == 0U) {
+        return 0;
+    }
     address_space_stack_physical = allocate_page();
     if (address_space_stack_physical == 0U) {
         (void)release_page(address_space_code_physical);
@@ -3920,19 +3940,80 @@ static int prepare_embedded_hello_address_space(
     return 1;
 }
 
-static void run_embedded_hello(void)
+static int app_hex_digit(char character)
 {
-    unsigned int image_size = (unsigned int)_binary_build_hello_elf_end -
-                              (unsigned int)_binary_build_hello_elf_start;
-    struct elf32_image_info info;
-    if (elf32_validate(_binary_build_hello_elf_start, image_size, &info) !=
-        ELF32_VALID) {
-        put_string("Embedded app 'hello' failed ELF validation.\n");
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    return -1;
+}
+
+static void run_stored_application(const char *app_name)
+{
+    char file_name[FILENAME_MAX_LEN + 1U];
+    if (!file_store_ready) {
+        report_file_store_unavailable();
         return;
     }
-    if (!prepare_embedded_hello_address_space(
-            _binary_build_hello_elf_start, &info)) {
-        put_string("Could not load embedded app 'hello'.\n");
+    unsigned int name_length = string_length(app_name);
+    if (name_length == 0U || name_length > FILENAME_MAX_LEN - 4U ||
+        !file_name_valid(app_name)) {
+        put_string("Invalid app name. Use run <name> (max 11 characters).\n");
+        return;
+    }
+    for (unsigned int i = 0U; i < name_length; ++i) {
+        file_name[i] = app_name[i];
+    }
+    file_name[name_length] = '.';
+    file_name[name_length + 1U] = 'e';
+    file_name[name_length + 2U] = 'l';
+    file_name[name_length + 3U] = 'f';
+    file_name[name_length + 4U] = '\0';
+
+    int slot = entry_find(file_name, current_directory);
+    if (slot < 0) {
+        put_string("App file not found: ");
+        put_string(file_name);
+        put_string(". Use install hello to add the sample app.\n");
+        return;
+    }
+    if (files[slot].is_directory) {
+        put_string("App path is a directory: ");
+        put_string(file_name);
+        put_char('\n');
+        return;
+    }
+
+    unsigned int encoded_size = string_length(files[slot].content);
+    if (encoded_size == 0U || (encoded_size & 1U) != 0U ||
+        encoded_size / 2U > sizeof(app_image_buffer)) {
+        put_string("Stored app is empty or has an invalid hex encoding.\n");
+        return;
+    }
+    unsigned int image_size = encoded_size / 2U;
+    for (unsigned int i = 0U; i < image_size; ++i) {
+        int high = app_hex_digit(files[slot].content[i * 2U]);
+        int low = app_hex_digit(files[slot].content[i * 2U + 1U]);
+        if (high < 0 || low < 0) {
+            put_string("Stored app contains a non-hexadecimal byte.\n");
+            return;
+        }
+        app_image_buffer[i] = (unsigned char)((high << 4) | low);
+    }
+
+    struct elf32_image_info info;
+    if (elf32_validate(app_image_buffer, image_size, &info) != ELF32_VALID) {
+        put_string("Stored app failed ELF32 validation.\n");
+        return;
+    }
+    if (!prepare_user_elf_address_space(app_image_buffer, &info)) {
+        put_string("Could not load app into a user address space.\n");
         return;
     }
 
@@ -3950,12 +4031,80 @@ static void run_embedded_hello(void)
     __asm__ volatile ("sti");
 
     if (embedded_app_exit_seen != 0) {
-        put_string("Application 'hello' exited with status ");
+        put_string("Application '");
+        put_string(app_name);
+        put_string("' exited with status ");
         put_unsigned(embedded_app_exit_status);
         put_string(".\n");
     } else {
-        put_string("Application 'hello' returned without an exit status.\n");
+        put_string("Application '");
+        put_string(app_name);
+        put_string("' returned without an exit status.\n");
     }
+}
+
+static void install_sample_application(void)
+{
+    if (!file_store_ready) {
+        report_file_store_unavailable();
+        return;
+    }
+    if (boot_app_image_size == 0U) {
+        put_string("Sample ELF is unavailable from the boot ISO. Rebuild and boot the latest ISO.\n");
+        return;
+    }
+
+    struct elf32_image_info info;
+    if (elf32_validate(boot_app_image, boot_app_image_size, &info) !=
+        ELF32_VALID) {
+        put_string("Sample app from the boot ISO failed ELF32 validation.\n");
+        return;
+    }
+    if (boot_app_image_size > FILE_CONTENT_MAX / 2U) {
+        put_string("Sample app is too large for the TinyOS file store.\n");
+        return;
+    }
+
+    static const char hex_digits[] = "0123456789ABCDEF";
+    for (unsigned int i = 0U; i < boot_app_image_size; ++i) {
+        unsigned char byte = boot_app_image[i];
+        filesystem_write_buffer[i * 2U] = hex_digits[byte >> 4];
+        filesystem_write_buffer[i * 2U + 1U] = hex_digits[byte & 0x0FU];
+    }
+    filesystem_write_buffer[boot_app_image_size * 2U] = '\0';
+
+    const char *file_name = "hello.elf";
+    int slot = entry_find(file_name, current_directory);
+    if (slot >= 0 && files[slot].is_directory) {
+        put_string("Cannot install app: hello.elf is a directory.\n");
+        return;
+    }
+    if (slot < 0) {
+        slot = file_free_slot();
+    }
+    if (slot < 0) {
+        put_string("Entry store is full (max 16 total entries).\n");
+        return;
+    }
+
+    file_entry_copy(&file_entry_backup, &files[slot]);
+    copy_string(files[slot].name, FILENAME_MAX_LEN, file_name);
+    copy_string(files[slot].content, FILE_CONTENT_MAX, filesystem_write_buffer);
+    files[slot].used = 1;
+    files[slot].is_directory = 0;
+    files[slot].parent = current_directory;
+    files[slot].first_cluster = FILESYSTEM_CLUSTER_FREE;
+    files[slot].cluster_count = 0U;
+    int result = filesystem_save_change((unsigned int)slot, &file_entry_backup);
+    if (result < 0) {
+        put_string("App install failed: ");
+        put_string(file_store_error_message(result));
+        put_char('\n');
+        return;
+    }
+    put_string("Installed hello.elf in the persistent file store (hex-encoded ");
+    put_unsigned(boot_app_image_size);
+    put_string("-byte ELF).\n");
 }
 
 static void run_syscall_demo(void)
@@ -4065,8 +4214,8 @@ static void run_elf_validation_demo(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, run <app>\n");
-        put_string("Apps: run hello starts the embedded ELF32 hello app.\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello, run <app>\n");
+        put_string("Apps: install hello saves the ISO sample app to persistent storage; run <name> loads <name>.elf from the current directory.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -4084,14 +4233,16 @@ static void run_command(void)
         run_elf_validation_demo();
     } else if (command_is("addrspacedemo")) {
         run_address_space_demo();
+    } else if (command_is("install hello")) {
+        install_sample_application();
+    } else if (command_starts_with("install ")) {
+        put_string("Usage: install hello\n");
     } else if (command_is("run")) {
         put_string("Usage: run <app>\n");
     } else if (command_starts_with("run ")) {
         const char *app_name = command_args_after("run ");
-        if (app_name != 0 && command_is("run hello")) {
-            run_embedded_hello();
-        } else if (app_name != 0) {
-            put_string("Unknown app. Available app: hello\n");
+        if (app_name != 0) {
+            run_stored_application(app_name);
         } else {
             put_string("Usage: run <app>\n");
         }
@@ -4759,6 +4910,20 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
     if (boot_magic == MULTIBOOT_BOOTLOADER_MAGIC && info_address != 0U) {
         const struct multiboot_info *info =
             (const struct multiboot_info *)info_address;
+        if ((info->flags & MULTIBOOT_INFO_MODULES) != 0U &&
+            info->mods_count != 0U && info->mods_addr != 0U) {
+            const struct multiboot_module *module =
+                (const struct multiboot_module *)info->mods_addr;
+            if (module->end >= module->start &&
+                module->end - module->start <= BOOT_APP_MAX_SIZE) {
+                boot_app_image_size = module->end - module->start;
+                const unsigned char *source =
+                    (const unsigned char *)module->start;
+                for (unsigned int i = 0U; i < boot_app_image_size; ++i) {
+                    boot_app_image[i] = source[i];
+                }
+            }
+        }
         if ((info->flags & MULTIBOOT_INFO_MEMORY) != 0U) {
             memory_lower_kib = info->mem_lower;
             memory_upper_kib = info->mem_upper;
@@ -4823,4 +4988,3 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         }
     }
 }
-

@@ -8,7 +8,6 @@ DISK_SIZE_MB := 16
 CC := gcc
 AS := nasm
 LD := ld
-OBJCOPY := objcopy
 CFLAGS := -m32 -std=c11 -ffreestanding -O2 -Wall -Wextra -Werror \
           -fno-stack-protector -fno-pic -fno-pie \
           -fno-asynchronous-unwind-tables -fno-unwind-tables
@@ -42,9 +41,6 @@ $(BUILD_DIR)/hello_app.o: apps/hello.asm | $(BUILD_DIR)
 $(BUILD_DIR)/hello.elf: $(BUILD_DIR)/hello_app.o apps/user.ld
 	$(LD) -m elf_i386 -T apps/user.ld -nostdlib -o $@ $(BUILD_DIR)/hello_app.o
 
-$(BUILD_DIR)/hello_embedded.o: $(BUILD_DIR)/hello.elf
-	$(OBJCOPY) -I binary -O elf32-i386 -B i386 $< $@
-
 $(BUILD_DIR)/disk.o: disk.c disk.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -54,24 +50,28 @@ $(BUILD_DIR)/heap.o: heap.c heap.h | $(BUILD_DIR)
 $(BUILD_DIR)/gdt.o: gdt.c gdt.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/hello_embedded.o linker.ld
-	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/hello_embedded.o
+$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o linker.ld
+	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o
 	grub-file --is-x86-multiboot $@
 
-iso: $(KERNEL) grub.cfg
+iso: $(KERNEL) $(BUILD_DIR)/hello.elf grub.cfg
 	set -eu; \
 	staging=$$(mktemp -d /tmp/tinyos-isodir.XXXXXX); \
 	image=$$(mktemp /tmp/tinyos-image.XXXXXX.iso); \
 	trap 'rm -rf "$$staging"; rm -f "$$image"' EXIT; \
-	mkdir -p "$$staging/boot/grub" "$(ISO_ROOT)/boot/grub"; \
+	mkdir -p "$$staging/boot/grub" "$$staging/boot/apps" "$(ISO_ROOT)/boot/grub" "$(ISO_ROOT)/boot/apps"; \
 	cp "$(KERNEL)" "$$staging/boot/kernel.elf"; \
+	cp "$(BUILD_DIR)/hello.elf" "$$staging/boot/apps/hello.elf"; \
 	cp grub.cfg "$$staging/boot/grub/grub.cfg"; \
 	grub-mkrescue -o "$$image" "$$staging"; \
 	xorriso -osirrox on -indev "$$image" -extract /boot/kernel.elf "$$staging/kernel.checked"; \
 	cmp "$(KERNEL)" "$$staging/kernel.checked"; \
 	xorriso -osirrox on -indev "$$image" -extract /boot/grub/grub.cfg "$$staging/grub.checked"; \
 	cmp grub.cfg "$$staging/grub.checked"; \
+	xorriso -osirrox on -indev "$$image" -extract /boot/apps/hello.elf "$$staging/hello.checked"; \
+	cmp "$(BUILD_DIR)/hello.elf" "$$staging/hello.checked"; \
 	cp "$(KERNEL)" "$(ISO_ROOT)/boot/kernel.elf"; \
+	cp "$(BUILD_DIR)/hello.elf" "$(ISO_ROOT)/boot/apps/hello.elf"; \
 	cp grub.cfg "$(ISO_ROOT)/boot/grub/grub.cfg"; \
 	cp "$$image" "$(ISO)"
 
@@ -91,4 +91,3 @@ debug-run: debug disk-image
 
 clean:
 	rm -rf $(BUILD_DIR)
-
