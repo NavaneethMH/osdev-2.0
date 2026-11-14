@@ -3,6 +3,7 @@ ISO_ROOT := $(BUILD_DIR)/isodir
 KERNEL := $(BUILD_DIR)/kernel.elf
 ISO := $(BUILD_DIR)/tinyos.iso
 DISK_IMAGE := disk/tinyos.img
+RECOVERY_DISK_IMAGE := disk/tinyos-recovery.img
 DISK_SIZE_MB := 16
 
 CC := gcc
@@ -16,7 +17,7 @@ ifeq ($(DEBUG),1)
 CFLAGS += -DHEAP_DEBUG
 endif
 
-.PHONY: all iso run debug debug-run clean disk-image
+.PHONY: all iso run debug debug-run recovery-run clean disk-image
 
 all: iso
 
@@ -98,6 +99,11 @@ debug:
 
 debug-run: debug disk-image
 	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK_IMAGE),format=raw,if=ide,index=0,media=disk -m 128M
+
+recovery-run: iso
+	mkdir -p disk
+	if [ ! -f "$(RECOVERY_DISK_IMAGE)" ]; then truncate -s $(DISK_SIZE_MB)M "$(RECOVERY_DISK_IMAGE)"; fi
+	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(RECOVERY_DISK_IMAGE),format=raw,if=ide,index=0,media=disk -m 128M
 
 clean:
 	rm -rf $(BUILD_DIR)

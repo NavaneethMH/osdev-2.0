@@ -4893,14 +4893,15 @@ static void run_command(void)
                 inspect_file_chain((unsigned int)idx);
             }
         }
-    } else if (command_is("fsck repair confirm")) {
+    } else if (command_is("fsck repair confirm") ||
+               command_is("fsck confirm")) {
         run_filesystem_repair_preview(1);
     } else if (command_is("fsck repair")) {
         run_filesystem_repair_preview(0);
     } else if (command_is("fsck")) {
         run_filesystem_check();
     } else if (command_starts_with("fsck ")) {
-        put_string("Usage: fsck, fsck repair, or fsck repair confirm\n");
+        put_string("Usage: fsck, fsck repair, fsck repair confirm, or fsck confirm\n");
     } else if (command_is("alloc")) {
         unsigned int page = allocate_page();
         if (page == 0U) {
