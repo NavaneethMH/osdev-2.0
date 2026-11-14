@@ -3738,6 +3738,38 @@ static void show_disk_info(void)
     put_char('\n');
 }
 
+static void report_file_store_unavailable(void);
+
+static void show_filesystem_info(void)
+{
+    if (!file_store_ready) {
+        report_file_store_unavailable();
+        return;
+    }
+
+    put_string("TinyOS filesystem: ready\nFormat version: ");
+    put_unsigned(FILESYSTEM_VERSION);
+    put_string(" (legacy versions 1-3 migrate to this format)\nSector size: ");
+    put_unsigned(DISK_SECTOR_SIZE);
+    put_string(" bytes\nSuperblock: LBA ");
+    put_unsigned(FILESYSTEM_SUPER_LBA);
+    put_string("\nDirectory: LBA ");
+    put_unsigned(FILESYSTEM_DIRECTORY_LBA);
+    put_string(" (16 entries, 32 bytes each)\nAllocation table: LBA ");
+    put_unsigned(FILESYSTEM_FAT_LBA);
+    put_string("-");
+    put_unsigned(FILESYSTEM_FAT_LBA + FILESYSTEM_FAT_SECTORS - 1U);
+    put_string(" (4096 little-endian 16-bit entries)\nData clusters: ");
+    put_unsigned(FILESYSTEM_CLUSTER_COUNT);
+    put_string(" clusters, 512 bytes each; LBAs ");
+    put_unsigned(FILESYSTEM_DATA_START_LBA);
+    put_string("-");
+    put_unsigned(FILESYSTEM_DATA_END_LBA);
+    put_string("\nReserved disk-test sector: LBA ");
+    put_unsigned(DISK_TEST_SECTOR);
+    put_char('\n');
+}
+
 static void run_disk_test(void)
 {
     unsigned char write_buffer[DISK_SECTOR_SIZE];
@@ -4214,7 +4246,7 @@ static void run_elf_validation_demo(void)
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello, run <app>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello, run <app>\n");
         put_string("Apps: install hello saves the ISO sample app to persistent storage; run <name> loads <name>.elf from the current directory.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
@@ -4282,6 +4314,8 @@ static void run_command(void)
         run_heap_demo();
     } else if (command_is("diskinfo")) {
         show_disk_info();
+    } else if (command_is("fsinfo")) {
+        show_filesystem_info();
     } else if (command_is("disktest")) {
         run_disk_test();
     } else if (command_is("df")) {
