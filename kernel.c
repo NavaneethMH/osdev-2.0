@@ -16,6 +16,8 @@
 #define PAGING_MAPPED_LIMIT 0x02000000U /* First 32 MiB identity-mapped. */
 #define VM_DYNAMIC_TABLES 8U
 #define VM_TEST_VIRTUAL_ADDRESS 0x40000000U
+#define USER_CODE_ADDRESS 0x40000000U
+#define USER_STACK_ADDRESS (USER_CODE_ADDRESS + PAGE_SIZE)
 #define MAX_TASKS 4U
 #define TASK_STACK_SIZE 4096U
 #define TASK_NAME_MAX 15U
@@ -125,8 +127,12 @@ extern void enter_user_mode(unsigned int entry, unsigned int stack_top);
 extern void ring3_demo_user(void);
 extern void ring3_demo_return_trampoline(void);
 extern void syscall128(void);
+extern unsigned char user_blob_start[];
+extern unsigned char user_blob_end[];
 extern void ring3_syscall_demo_user(void);
+extern void ring3_protection_demo_user(void);
 extern unsigned char ring3_syscall_message[];
+extern unsigned char ring3_syscall_message_end[];
 
 static volatile unsigned short *const video = (volatile unsigned short *)0xB8000;
 static unsigned int cursor = 0;
@@ -179,12 +185,14 @@ static int paging_enabled = 0;
 
 static volatile int ring3_demo_active = 0;
 static volatile int ring3_demo_trap_seen = 0;
-static unsigned char ring3_demo_stack[4096] __attribute__((aligned(16)));
 static volatile int syscall_demo_active = 0;
 static volatile int syscall_demo_write_seen = 0;
 static volatile int syscall_demo_yield_seen = 0;
 static volatile int syscall_demo_exit_seen = 0;
-static unsigned char syscall_demo_stack[4096] __attribute__((aligned(16)));
+static volatile int user_protection_fault_seen = 0;
+static volatile int user_demo_active = 0;
+static unsigned int user_code_physical = 0U;
+static unsigned int user_stack_physical = 0U;
 
 /* Stage 2 task model. The bootstrap task continues on GRUB's stack while
    worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
@@ -1044,7 +1052,9 @@ static int dynamic_table_for(unsigned int directory_index, int create,
     return -1;
 }
 
-static int vm_map_page(unsigned int virtual_address, unsigned int physical_address)
+static int vm_map_page_flags(unsigned int virtual_address,
+                             unsigned int physical_address,
+                             unsigned int flags)
 {
     if (!paging_enabled || virtual_address < PAGING_MAPPED_LIMIT ||
         (virtual_address & (PAGE_SIZE - 1U)) != 0U ||
@@ -1061,11 +1071,18 @@ static int vm_map_page(unsigned int virtual_address, unsigned int physical_addre
         return 0;
     }
 
-    /* Present and writable; supervisor-only. */
-    table[table_index] = physical_address | 0x03U;
+    table[table_index] = physical_address | flags;
+    if ((flags & 0x04U) != 0U) {
+        page_directory[directory_index] |= 0x04U;
+    }
     ++dynamic_mapped_pages;
     invalidate_page(virtual_address);
     return 1;
+}
+
+static int vm_map_page(unsigned int virtual_address, unsigned int physical_address)
+{
+    return vm_map_page_flags(virtual_address, physical_address, 0x03U);
 }
 
 static int vm_page_is_mapped(unsigned int virtual_address)
@@ -1114,6 +1131,18 @@ static int vm_unmap_page(unsigned int virtual_address)
         dynamic_page_table_directory[(unsigned int)slot] = 0U;
     }
     return 1;
+}
+
+static unsigned int vm_page_flags(unsigned int virtual_address)
+{
+    unsigned int directory_index = virtual_address >> 22;
+    unsigned int table_index = (virtual_address >> 12) & 0x3FFU;
+    unsigned int *table = 0;
+    if (directory_index >= 1024U ||
+        dynamic_table_for(directory_index, 0, &table) < 0) {
+        return 0U;
+    }
+    return table[table_index] & 0xFFFU;
 }
 
 static unsigned int allocate_page(void)
@@ -1200,6 +1229,83 @@ static int release_page(unsigned int address)
     }
 
     return 0;
+}
+
+static void clear_physical_page(unsigned int address)
+{
+    volatile unsigned char *page = (volatile unsigned char *)address;
+    for (unsigned int i = 0U; i < PAGE_SIZE; ++i) {
+        page[i] = 0U;
+    }
+}
+
+/* Map a copied, read-only user code page and a separate writable user stack.
+   The kernel's low identity map remains supervisor-only. */
+static int prepare_user_demo_memory(void)
+{
+    unsigned int blob_start = (unsigned int)user_blob_start;
+    unsigned int blob_end = (unsigned int)user_blob_end;
+    unsigned int blob_size = blob_end - blob_start;
+    if (blob_end < blob_start || blob_size == 0U || blob_size > PAGE_SIZE) {
+        return 0;
+    }
+
+    user_code_physical = allocate_page();
+    if (user_code_physical == 0U) {
+        return 0;
+    }
+    user_stack_physical = allocate_page();
+    if (user_stack_physical == 0U) {
+        (void)release_page(user_code_physical);
+        user_code_physical = 0U;
+        return 0;
+    }
+
+    clear_physical_page(user_code_physical);
+    clear_physical_page(user_stack_physical);
+    unsigned char *destination = (unsigned char *)user_code_physical;
+    const unsigned char *source = user_blob_start;
+    for (unsigned int i = 0U; i < blob_size; ++i) {
+        destination[i] = source[i];
+    }
+
+    if (!vm_map_page_flags(USER_CODE_ADDRESS, user_code_physical, 0x05U) ||
+        !vm_map_page_flags(USER_STACK_ADDRESS, user_stack_physical, 0x07U)) {
+        (void)vm_unmap_page(USER_STACK_ADDRESS);
+        (void)vm_unmap_page(USER_CODE_ADDRESS);
+        (void)release_page(user_stack_physical);
+        (void)release_page(user_code_physical);
+        user_code_physical = 0U;
+        user_stack_physical = 0U;
+        return 0;
+    }
+
+    return 1;
+}
+
+static void cleanup_user_demo_memory(void)
+{
+    (void)vm_unmap_page(USER_CODE_ADDRESS);
+    (void)vm_unmap_page(USER_STACK_ADDRESS);
+    if (user_stack_physical != 0U) {
+        (void)release_page(user_stack_physical);
+        user_stack_physical = 0U;
+    }
+    if (user_code_physical != 0U) {
+        (void)release_page(user_code_physical);
+        user_code_physical = 0U;
+    }
+}
+
+static unsigned int kernel_page_flags(unsigned int virtual_address)
+{
+    unsigned int directory_index = virtual_address >> 22;
+    unsigned int table_index = (virtual_address >> 12) & 0x3FFU;
+    if (directory_index >= PAGE_TABLES_FOR_LIMIT ||
+        (page_directory[directory_index] & 0x01U) == 0U) {
+        return 0U;
+    }
+    return page_tables[directory_index][table_index] & 0xFFFU;
 }
 
 static void show_vm_info(void)
@@ -3117,6 +3223,17 @@ void exception_handler(unsigned int vector, unsigned int error_code,
         ring3_demo_trap_seen = 1;
         return;
     }
+    if (vector == 14U && user_demo_active != 0 && frame != 0 &&
+        (frame->cs & 3U) == 3U) {
+        unsigned int cr2;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        if (cr2 == 0x000B8000U && (error_code & 0x07U) == 0x07U) {
+            frame->eip = (unsigned int)ring3_demo_return_trampoline;
+            frame->cs = 0x08U;
+            user_protection_fault_seen = 1;
+            return;
+        }
+    }
     clear_screen();
     put_string("TinyOS stopped after a CPU exception.\n");
     put_string("Exception vector: 0x");
@@ -3135,9 +3252,7 @@ void exception_handler(unsigned int vector, unsigned int error_code,
     }
 }
 
-/* int 0x80 saves the user register set before entering this C dispatcher.
-   This milestone deliberately accepts only the demo's fixed message buffer;
-   general user-pointer validation is a later isolation milestone. */
+/* int 0x80 saves the user register set before entering this C dispatcher. */
 struct syscall_cpu_frame {
     unsigned int edi;
     unsigned int esi;
@@ -3162,8 +3277,6 @@ enum syscall_number {
     SYSCALL_YIELD = 3U
 };
 
-#define SYSCALL_DEMO_MESSAGE_LENGTH 41U
-
 void syscall_handler(struct syscall_cpu_frame *frame)
 {
     if (frame == 0 || frame->vector != 128U ||
@@ -3173,9 +3286,13 @@ void syscall_handler(struct syscall_cpu_frame *frame)
 
     switch (frame->eax) {
         case SYSCALL_WRITE:
-            if (frame->ebx == (unsigned int)ring3_syscall_message &&
-                frame->ecx == SYSCALL_DEMO_MESSAGE_LENGTH) {
-                const unsigned char *message = ring3_syscall_message;
+            if (frame->ebx == USER_CODE_ADDRESS +
+                    ((unsigned int)ring3_syscall_message -
+                     (unsigned int)user_blob_start) &&
+                frame->ecx == ((unsigned int)ring3_syscall_message_end -
+                               (unsigned int)ring3_syscall_message)) {
+                const unsigned char *message =
+                    (const unsigned char *)frame->ebx;
                 for (unsigned int i = 0; i < frame->ecx; ++i) {
                     put_char((char)message[i]);
                 }
@@ -3485,11 +3602,18 @@ static void run_ring3_demo(void)
         put_string("Paging must be enabled before ring3demo.\n");
         return;
     }
+    if (!prepare_user_demo_memory()) {
+        put_string("Could not allocate/map the temporary user pages.\n");
+        return;
+    }
     ring3_demo_trap_seen = 0;
     ring3_demo_active = 1;
-    enter_user_mode((unsigned int)ring3_demo_user,
-                    (unsigned int)(ring3_demo_stack + sizeof(ring3_demo_stack)));
+    enter_user_mode(USER_CODE_ADDRESS +
+                        ((unsigned int)ring3_demo_user -
+                         (unsigned int)user_blob_start),
+                    USER_STACK_ADDRESS + PAGE_SIZE - 16U);
     ring3_demo_active = 0;
+    cleanup_user_demo_memory();
     __asm__ volatile ("sti");
     put_string(ring3_demo_trap_seen != 0
         ? "Ring 3 entry and TSS kernel-stack return passed.\n"
@@ -3502,14 +3626,21 @@ static void run_syscall_demo(void)
         put_string("Paging must be enabled before syscalldemo.\n");
         return;
     }
+    if (!prepare_user_demo_memory()) {
+        put_string("Could not allocate/map the temporary user pages.\n");
+        return;
+    }
 
     syscall_demo_write_seen = 0;
     syscall_demo_yield_seen = 0;
     syscall_demo_exit_seen = 0;
     syscall_demo_active = 1;
-    enter_user_mode((unsigned int)ring3_syscall_demo_user,
-                    (unsigned int)(syscall_demo_stack + sizeof(syscall_demo_stack)));
+    enter_user_mode(USER_CODE_ADDRESS +
+                        ((unsigned int)ring3_syscall_demo_user -
+                         (unsigned int)user_blob_start),
+                    USER_STACK_ADDRESS + PAGE_SIZE - 16U);
     syscall_demo_active = 0;
+    cleanup_user_demo_memory();
     __asm__ volatile ("sti");
 
     if (syscall_demo_write_seen != 0 && syscall_demo_yield_seen == 1U &&
@@ -3526,10 +3657,49 @@ static void run_syscall_demo(void)
     }
 }
 
+static void run_user_protection_demo(void)
+{
+    if (paging_enabled == 0) {
+        put_string("Paging must be enabled before usermemdemo.\n");
+        return;
+    }
+    if (!prepare_user_demo_memory()) {
+        put_string("Could not allocate/map the temporary user pages.\n");
+        return;
+    }
+
+    unsigned int code_flags = vm_page_flags(USER_CODE_ADDRESS);
+    unsigned int stack_flags = vm_page_flags(USER_STACK_ADDRESS);
+    unsigned int kernel_flags = kernel_page_flags(0x000B8000U);
+    put_string("User code page: ");
+    put_string((code_flags & 0x05U) == 0x05U &&
+                       (code_flags & 0x02U) == 0U
+                   ? "user/read-only\n" : "permission check failed\n");
+    put_string("User stack page: ");
+    put_string((stack_flags & 0x07U) == 0x07U
+                   ? "user/read-write\n" : "permission check failed\n");
+    put_string("Kernel VGA page: ");
+    put_string((kernel_flags & 0x05U) == 0x01U
+                   ? "supervisor-only\n" : "permission check failed\n");
+
+    user_protection_fault_seen = 0;
+    user_demo_active = 1;
+    enter_user_mode(USER_CODE_ADDRESS +
+                        ((unsigned int)ring3_protection_demo_user -
+                         (unsigned int)user_blob_start),
+                    USER_STACK_ADDRESS + PAGE_SIZE - 16U);
+    user_demo_active = 0;
+    cleanup_user_demo_memory();
+    __asm__ volatile ("sti");
+    put_string(user_protection_fault_seen != 0
+        ? "Protection demo passed: user write to the kernel VGA page was blocked.\n"
+        : "Protection demo failed: expected kernel-page write fault was not observed.\n");
+}
+
 static void run_command(void)
 {
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, disktest, df, fscheck <file>, fsck, clear, echo <text>, ring3demo, syscalldemo, usermemdemo\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -3541,6 +3711,8 @@ static void run_command(void)
         run_ring3_demo();
     } else if (command_is("syscalldemo")) {
         run_syscall_demo();
+    } else if (command_is("usermemdemo")) {
+        run_user_protection_demo();
     } else if (command_is("taskinfo")) {
         show_task_info();
     } else if (command_is("taskdemo")) {
