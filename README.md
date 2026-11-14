@@ -21,7 +21,7 @@ TinyOS is a small operating system built from scratch as a systems-programming l
 - Task groundwork: task states, IDs, saved CPU contexts, per-task 4 KiB stacks, cooperative yields, timed blocking/wakeup, and a round-robin scheduler demo
 - Shell commands `taskinfo`, `taskdemo`, `sleepdemo`, and `preemptdemo`; the preemption demo lets the PIT timer switch between workers that do not yield
 - Stage 3 privilege groundwork: kernel/user GDT descriptors, a 32-bit TSS, and a controlled `ring3demo` transition that returns through the TSS kernel stack
-- Stage 3 system-call groundwork: a user-callable `int 0x80` gate with a controlled `syscalldemo` for `write`, `yield`, and `exit`
+- Stage 3 system calls: a user-callable `int 0x80` gate for `write`, `yield`, and `exit`, with bounds and page-permission checks on output buffers
 - Stage 3 memory protection: temporary user code and stack pages have explicit user permissions, user code is read-only, and kernel identity mappings remain supervisor-only
 - Persistent TinyOS file store on the QEMU disk: up to 16 files and directories combined, names up to 15 characters, file contents up to 32768 characters across dynamically allocated sectors
 - FAT-style free-space map and linked disk clusters, allowing files to share disk space and reclaim it after deletion or rewrite
@@ -62,9 +62,11 @@ File commands: `ls` lists entries in the current directory (`/` marks directorie
 
 Stage 3, Milestone 1 test: run `ring3demo`. It should report `Ring 3 entry and TSS kernel-stack return passed.` and return to the shell. Then run `uptime` and `help` to confirm shell operation. The user code runs from a temporary user page; this remains a controlled demonstration, not general user-program support. Stage 3, Milestone 1 is complete and verified in QEMU.
 
-Stage 3, Milestone 2 test: run `syscalldemo`. The ring-3 stub should print `Ring 3 says hello through write syscall.` using syscall 1, invoke syscall 3 (`yield`), then invoke syscall 2 (`exit`) and return through the TSS kernel stack. The shell should print `System-call demo passed: write, yield, and exit returned safely.` Then run `ring3demo`, `uptime`, and `help` to confirm the earlier privilege transition and shell remain responsive. This is a controlled demonstration: `write` accepts only its fixed message buffer, and `yield` uses the existing scheduler (which has no other ready task during this command). Stage 3, Milestone 2 is complete and verified in QEMU.
+Stage 3, Milestone 2 established the `write`, `yield`, and `exit` system calls through `int 0x80`, and was verified in QEMU. The `syscalldemo` command now also runs the Stage 3, Milestone 4 rejection checks described below.
 
 Stage 3, Milestone 3 test: run `usermemdemo`. It should report user code as `user/read-only`, the user stack as `user/read-write`, and the kernel VGA page as `supervisor-only`. The deliberate ring-3 write to VGA memory should trigger a contained page fault and print `Protection demo passed: user write to the kernel VGA page was blocked.` Then run `syscalldemo`, `ring3demo`, `uptime`, and `help` to confirm the earlier commands still work. The code and stack mappings are temporary and are removed when each demo returns. General ELF loading and validation of arbitrary syscall pointers are later work. Stage 3, Milestone 3 is complete and verified in VirtualBox.
+
+Stage 3, Milestone 4 test: run `syscalldemo`. It should print the normal message, then report that write/yield/exit work and that a kernel pointer, a buffer crossing into an unmapped page, an oversized buffer, and an unknown syscall number were rejected. The demo also verifies the user code observed each error and exits with status zero. Then run `usermemdemo`, `ring3demo`, `uptime`, and `help`. The syscall gate remains restricted to the controlled demo; general processes, file syscalls, and per-process address spaces are future work. Stage 3, Milestone 4 is complete and verified in VirtualBox.
 
 To check renaming, run `write draft keep this text`, `df`, `rename draft final`, `cat final`, and `df` again; the content should remain and cluster usage should not change. `cat draft` should report that the old name is missing. Create a directory with `mkdir olddir`, rename it with `rename olddir newdir`, then run `cd newdir` and `pwd`; the path should show `/newdir`. Try `rename final newdir` to confirm an existing destination name is refused. Restart TinyOS and run `cat final` to confirm the new name persists.
 
@@ -92,15 +94,9 @@ To build the ISO without starting QEMU:
 make iso
 ```
 
-The ISO is written to `build/tinyos.iso`. To build into a separate folder for a milestone variant, pass `BUILD_DIR`; for example, the Stage 3 syscall milestone can be built and run with:
+The current combined TinyOS source builds to one ISO at `build/tinyos.iso`. Each milestone updates the same output when you run `make iso`; there is no need to merge older ISO images because their code changes are already part of the source tree. Attach `build/tinyos.iso` to the VM's optical drive and boot from Optical before Hard Disk. Generated ISO files are not committed to GitHub.
 
-```sh
-make clean BUILD_DIR=build-syscall
-make iso BUILD_DIR=build-syscall
-make run BUILD_DIR=build-syscall
-```
-
-This creates `build-syscall/tinyos.iso`. Attach that file to the VM's optical drive and boot from Optical before Hard Disk. For the user-page protection milestone, use a separate `BUILD_DIR=build-usermem` in the same commands; this creates `build-usermem/tinyos.iso` and preserves the prior ISO. Generated ISO files are not committed to GitHub.
+For a clean rebuild into that same location, run `make clean` and then `make iso`. Close the VM first if it is currently using the ISO.
 
 ## Roadmap
 
@@ -136,7 +132,9 @@ For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report 
 26. (Stage 3, Milestone 1 — Complete; verified in QEMU) Add kernel/user privilege descriptors, a TSS kernel-stack pointer, and a controlled ring-3 entry/return demo.
 27. (Stage 3, Milestone 2 — Complete; verified in QEMU) Add a user-callable system-call entry and the initial `write`, `yield`, and `exit` services.
 28. (Stage 3, Milestone 3 — Complete; verified in VirtualBox) Map dedicated user code/stack pages with appropriate permissions and contain a user-mode write attempt against a supervisor-only kernel page.
+29. (Stage 3, Milestone 4 — Complete; verified in VirtualBox) Validate syscall numbers and every page in bounded user output-buffer ranges; reject kernel pointers, unmapped cross-page ranges, and oversized writes before reading them.
 
 ## License
 
 TinyOS is released under the [MIT License](LICENSE).
+
