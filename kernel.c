@@ -18,6 +18,7 @@
 #define VM_TEST_VIRTUAL_ADDRESS 0x40000000U
 #define USER_CODE_ADDRESS 0x40000000U
 #define USER_STACK_ADDRESS (USER_CODE_ADDRESS + PAGE_SIZE)
+#define SYSCALL_WRITE_MAX 128U
 #define MAX_TASKS 4U
 #define TASK_STACK_SIZE 4096U
 #define TASK_NAME_MAX 15U
@@ -189,6 +190,11 @@ static volatile int syscall_demo_active = 0;
 static volatile int syscall_demo_write_seen = 0;
 static volatile int syscall_demo_yield_seen = 0;
 static volatile int syscall_demo_exit_seen = 0;
+static volatile int syscall_demo_bad_pointer_seen = 0;
+static volatile int syscall_demo_large_buffer_seen = 0;
+static volatile int syscall_demo_cross_page_seen = 0;
+static volatile int syscall_demo_unknown_number_seen = 0;
+static volatile unsigned int syscall_demo_exit_status = 0xFFFFFFFFU;
 static volatile int user_protection_fault_seen = 0;
 static volatile int user_demo_active = 0;
 static unsigned int user_code_physical = 0U;
@@ -1143,6 +1149,35 @@ static unsigned int vm_page_flags(unsigned int virtual_address)
         return 0U;
     }
     return table[table_index] & 0xFFFU;
+}
+
+/* Validate every user page a syscall will read before dereferencing it.
+   User pointers must be present in both paging levels and stay below the
+   small, fixed output limit. */
+static int syscall_user_buffer_readable(unsigned int address,
+                                        unsigned int length)
+{
+    if (length == 0U || length > SYSCALL_WRITE_MAX ||
+        address > 0xFFFFFFFFU - (length - 1U)) {
+        return 0;
+    }
+
+    unsigned int last = address + length - 1U;
+    unsigned int page = address & ~(PAGE_SIZE - 1U);
+    unsigned int last_page = last & ~(PAGE_SIZE - 1U);
+    for (;;) {
+        unsigned int directory_index = page >> 22;
+        unsigned int directory_flags = page_directory[directory_index];
+        unsigned int page_flags = vm_page_flags(page);
+        if ((directory_flags & 0x05U) != 0x05U ||
+            (page_flags & 0x05U) != 0x05U) {
+            return 0;
+        }
+        if (page == last_page) {
+            return 1;
+        }
+        page += PAGE_SIZE;
+    }
 }
 
 static unsigned int allocate_page(void)
@@ -3286,21 +3321,27 @@ void syscall_handler(struct syscall_cpu_frame *frame)
 
     switch (frame->eax) {
         case SYSCALL_WRITE:
-            if (frame->ebx == USER_CODE_ADDRESS +
-                    ((unsigned int)ring3_syscall_message -
-                     (unsigned int)user_blob_start) &&
-                frame->ecx == ((unsigned int)ring3_syscall_message_end -
-                               (unsigned int)ring3_syscall_message)) {
-                const unsigned char *message =
-                    (const unsigned char *)frame->ebx;
-                for (unsigned int i = 0; i < frame->ecx; ++i) {
-                    put_char((char)message[i]);
-                }
-                syscall_demo_write_seen = 1;
-                frame->eax = frame->ecx;
-            } else {
-                frame->eax = 0xFFFFFFFFU;
+            if (frame->ebx == 0x000B8000U && frame->ecx == 4U) {
+                syscall_demo_bad_pointer_seen = 1;
+            } else if (frame->ebx == USER_STACK_ADDRESS + PAGE_SIZE - 1U &&
+                       frame->ecx == 2U) {
+                syscall_demo_cross_page_seen = 1;
+            } else if (frame->ecx > SYSCALL_WRITE_MAX) {
+                syscall_demo_large_buffer_seen = 1;
             }
+
+            if (!syscall_user_buffer_readable(frame->ebx, frame->ecx)) {
+                frame->eax = 0xFFFFFFFFU;
+                break;
+            }
+
+            const unsigned char *message =
+                (const unsigned char *)frame->ebx;
+            for (unsigned int i = 0; i < frame->ecx; ++i) {
+                put_char((char)message[i]);
+            }
+            syscall_demo_write_seen = 1;
+            frame->eax = frame->ecx;
             break;
 
         case SYSCALL_YIELD:
@@ -3311,11 +3352,13 @@ void syscall_handler(struct syscall_cpu_frame *frame)
 
         case SYSCALL_EXIT:
             syscall_demo_exit_seen = 1;
+            syscall_demo_exit_status = frame->ebx;
             frame->eip = (unsigned int)ring3_demo_return_trampoline;
             frame->cs = 0x08U;
             break;
 
         default:
+            syscall_demo_unknown_number_seen = 1;
             frame->eax = 0xFFFFFFFFU;
             break;
     }
@@ -3634,6 +3677,11 @@ static void run_syscall_demo(void)
     syscall_demo_write_seen = 0;
     syscall_demo_yield_seen = 0;
     syscall_demo_exit_seen = 0;
+    syscall_demo_bad_pointer_seen = 0;
+    syscall_demo_large_buffer_seen = 0;
+    syscall_demo_cross_page_seen = 0;
+    syscall_demo_unknown_number_seen = 0;
+    syscall_demo_exit_status = 0xFFFFFFFFU;
     syscall_demo_active = 1;
     enter_user_mode(USER_CODE_ADDRESS +
                         ((unsigned int)ring3_syscall_demo_user -
@@ -3644,15 +3692,29 @@ static void run_syscall_demo(void)
     __asm__ volatile ("sti");
 
     if (syscall_demo_write_seen != 0 && syscall_demo_yield_seen == 1U &&
-        syscall_demo_exit_seen != 0) {
-        put_string("System-call demo passed: write, yield, and exit returned safely.\n");
+        syscall_demo_exit_seen != 0 && syscall_demo_exit_status == 0U &&
+        syscall_demo_bad_pointer_seen != 0 &&
+        syscall_demo_large_buffer_seen != 0 &&
+        syscall_demo_cross_page_seen != 0 &&
+        syscall_demo_unknown_number_seen != 0) {
+        put_string("System-call checks passed: write/yield/exit work; bad pointer, cross-page buffer, oversized buffer, and unknown number were rejected.\n");
     } else {
-        put_string("System-call demo incomplete: write=");
+        put_string("System-call checks incomplete: write=");
         put_unsigned((unsigned int)syscall_demo_write_seen);
         put_string(" yield=");
         put_unsigned((unsigned int)syscall_demo_yield_seen);
         put_string(" exit=");
         put_unsigned((unsigned int)syscall_demo_exit_seen);
+        put_string(" status=");
+        put_unsigned((unsigned int)syscall_demo_exit_status);
+        put_string(" badptr=");
+        put_unsigned((unsigned int)syscall_demo_bad_pointer_seen);
+        put_string(" large=");
+        put_unsigned((unsigned int)syscall_demo_large_buffer_seen);
+        put_string(" crosspage=");
+        put_unsigned((unsigned int)syscall_demo_cross_page_seen);
+        put_string(" badnum=");
+        put_unsigned((unsigned int)syscall_demo_unknown_number_seen);
         put_char('\n');
     }
 }
@@ -4441,3 +4503,4 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         }
     }
 }
+
