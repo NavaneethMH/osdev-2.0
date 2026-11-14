@@ -222,7 +222,24 @@ static unsigned int address_space_stack_physical = 0U;
 static unsigned int *active_user_address_space = 0;
 static unsigned char boot_app_image[BOOT_APP_MAX_SIZE];
 static unsigned int boot_app_image_size = 0U;
+static unsigned char boot_filedemo_image[BOOT_APP_MAX_SIZE];
+static unsigned int boot_filedemo_image_size = 0U;
 static unsigned char app_image_buffer[BOOT_APP_MAX_SIZE];
+
+#define MAX_APP_FILE_HANDLES 4U
+#define APP_FILE_READ 1U
+#define APP_FILE_WRITE 2U
+#define APP_FILE_CREATE 4U
+#define APP_FILE_TRUNCATE 8U
+
+struct app_file_handle {
+    unsigned int slot;
+    unsigned int offset;
+    unsigned int flags;
+    int open;
+};
+
+static struct app_file_handle app_file_handles[MAX_APP_FILE_HANDLES];
 
 /* Stage 2 task model. The bootstrap task continues on GRUB's stack while
    worker tasks use reserved stacks and saved cooperative/interrupt contexts. */
@@ -1206,6 +1223,38 @@ static int syscall_user_buffer_readable(unsigned int address,
         }
         if ((directory_flags & 0x05U) != 0x05U ||
             (page_flags & 0x05U) != 0x05U) {
+            return 0;
+        }
+        if (page == last_page) {
+            return 1;
+        }
+        page += PAGE_SIZE;
+    }
+}
+
+static int syscall_user_buffer_writable(unsigned int address,
+                                        unsigned int length)
+{
+    if (length == 0U || length > SYSCALL_WRITE_MAX ||
+        address > 0xFFFFFFFFU - (length - 1U)) {
+        return 0;
+    }
+
+    unsigned int last = address + length - 1U;
+    unsigned int page = address & ~(PAGE_SIZE - 1U);
+    unsigned int last_page = last & ~(PAGE_SIZE - 1U);
+    unsigned int *directory = active_user_address_space != 0
+        ? active_user_address_space : page_directory;
+    for (;;) {
+        unsigned int directory_entry = directory[page >> 22];
+        unsigned int page_flags = 0U;
+        if ((directory_entry & 0x01U) != 0U) {
+            unsigned int *table =
+                (unsigned int *)(directory_entry & 0xFFFFF000U);
+            page_flags = table[(page >> 12) & 0x3FFU] & 0xFFFU;
+        }
+        if ((directory_entry & 0x07U) != 0x07U ||
+            (page_flags & 0x07U) != 0x07U) {
             return 0;
         }
         if (page == last_page) {
@@ -3722,8 +3771,180 @@ struct syscall_cpu_frame {
 enum syscall_number {
     SYSCALL_WRITE = 1U,
     SYSCALL_EXIT = 2U,
-    SYSCALL_YIELD = 3U
+    SYSCALL_YIELD = 3U,
+    SYSCALL_FILE_OPEN = 4U,
+    SYSCALL_FILE_READ = 5U,
+    SYSCALL_FILE_WRITE = 6U,
+    SYSCALL_FILE_CLOSE = 7U
 };
+
+static int syscall_copy_filename(unsigned int address,
+                                 char name[FILENAME_MAX_LEN + 1U])
+{
+    if (address == 0U) {
+        return 0;
+    }
+    for (unsigned int i = 0U; i <= FILENAME_MAX_LEN; ++i) {
+        if (address > 0xFFFFFFFFU - i ||
+            !syscall_user_buffer_readable(address + i, 1U)) {
+            return 0;
+        }
+        char character = ((const char *)address)[i];
+        name[i] = character;
+        if (character == '\0') {
+            return file_name_valid(name);
+        }
+    }
+    return 0;
+}
+
+static int syscall_open_file(unsigned int name_address, unsigned int flags)
+{
+    char name[FILENAME_MAX_LEN + 1U];
+    unsigned int handle_index = MAX_APP_FILE_HANDLES;
+    for (unsigned int i = 0U; i < MAX_APP_FILE_HANDLES; ++i) {
+        if (!app_file_handles[i].open) {
+            handle_index = i;
+            break;
+        }
+    }
+    if (!file_store_ready ||
+        handle_index >= MAX_APP_FILE_HANDLES ||
+        !syscall_copy_filename(name_address, name) ||
+        (flags & ~(APP_FILE_READ | APP_FILE_WRITE | APP_FILE_CREATE |
+                   APP_FILE_TRUNCATE)) != 0U ||
+        (flags & (APP_FILE_READ | APP_FILE_WRITE)) == 0U ||
+        ((flags & APP_FILE_TRUNCATE) != 0U &&
+         (flags & APP_FILE_WRITE) == 0U) ||
+        ((flags & APP_FILE_CREATE) != 0U &&
+         (flags & APP_FILE_WRITE) == 0U)) {
+        return -1;
+    }
+
+    int slot = entry_find(name, current_directory);
+    if (slot < 0 && (flags & APP_FILE_CREATE) != 0U) {
+        slot = file_free_slot();
+        if (slot < 0) {
+            return -1;
+        }
+        file_entry_copy(&file_entry_backup, &files[slot]);
+        files[slot].name[0] = '\0';
+        files[slot].content[0] = '\0';
+        if (!copy_string(files[slot].name, FILENAME_MAX_LEN, name)) {
+            file_entry_copy(&files[slot], &file_entry_backup);
+            return -1;
+        }
+        files[slot].used = 1;
+        files[slot].is_directory = 0;
+        files[slot].parent = current_directory;
+        files[slot].first_cluster = FILESYSTEM_CLUSTER_FREE;
+        files[slot].cluster_count = 0U;
+        if (filesystem_save_change((unsigned int)slot, &file_entry_backup) < 0) {
+            return -1;
+        }
+    }
+    if (slot < 0 || files[slot].is_directory) {
+        return -1;
+    }
+
+    if ((flags & APP_FILE_TRUNCATE) != 0U) {
+        file_entry_copy(&file_entry_backup, &files[slot]);
+        files[slot].content[0] = '\0';
+        if (filesystem_save_change((unsigned int)slot,
+                                   &file_entry_backup) < 0) {
+            return -1;
+        }
+    }
+
+    app_file_handles[handle_index].slot = (unsigned int)slot;
+    app_file_handles[handle_index].offset = 0U;
+    app_file_handles[handle_index].flags = flags;
+    app_file_handles[handle_index].open = 1;
+    return (int)(handle_index + 1U);
+}
+
+static int syscall_read_file(unsigned int descriptor, unsigned int address,
+                             unsigned int length)
+{
+    if (descriptor == 0U || descriptor > MAX_APP_FILE_HANDLES ||
+        length > SYSCALL_WRITE_MAX ||
+        !app_file_handles[descriptor - 1U].open ||
+        (app_file_handles[descriptor - 1U].flags & APP_FILE_READ) == 0U ||
+        (length != 0U && !syscall_user_buffer_writable(address, length))) {
+        return -1;
+    }
+
+    struct app_file_handle *handle = &app_file_handles[descriptor - 1U];
+    unsigned int content_length;
+    if (handle->slot >= MAX_FILES ||
+        !filesystem_bounded_content_length(
+            files[handle->slot].content, &content_length)) {
+        return -1;
+    }
+    if (handle->offset >= content_length || length == 0U) {
+        return 0;
+    }
+    unsigned int count = content_length - handle->offset;
+    if (count > length) {
+        count = length;
+    }
+    unsigned char *destination = (unsigned char *)address;
+    const char *source = files[handle->slot].content + handle->offset;
+    for (unsigned int i = 0U; i < count; ++i) {
+        destination[i] = (unsigned char)source[i];
+    }
+    handle->offset += count;
+    return (int)count;
+}
+
+static int syscall_write_file(unsigned int descriptor, unsigned int address,
+                              unsigned int length)
+{
+    if (descriptor == 0U || descriptor > MAX_APP_FILE_HANDLES ||
+        length > SYSCALL_WRITE_MAX ||
+        !app_file_handles[descriptor - 1U].open ||
+        (app_file_handles[descriptor - 1U].flags & APP_FILE_WRITE) == 0U) {
+        return -1;
+    }
+    if (length == 0U) {
+        return 0;
+    }
+    if (!syscall_user_buffer_readable(address, length)) {
+        return -1;
+    }
+
+    struct app_file_handle *handle = &app_file_handles[descriptor - 1U];
+    unsigned int old_length;
+    if (handle->slot >= MAX_FILES ||
+        !filesystem_bounded_content_length(
+            files[handle->slot].content, &old_length) ||
+        handle->offset > FILE_CONTENT_MAX ||
+        length > FILE_CONTENT_MAX - handle->offset) {
+        return -1;
+    }
+    const unsigned char *source = (const unsigned char *)address;
+    for (unsigned int i = 0U; i < length; ++i) {
+        if (source[i] == 0U) {
+            return -1;
+        }
+    }
+
+    file_entry_copy(&file_entry_backup, &files[handle->slot]);
+    unsigned int end = handle->offset + length;
+    unsigned int new_length = old_length > end ? old_length : end;
+    while (old_length < handle->offset) {
+        files[handle->slot].content[old_length++] = ' ';
+    }
+    for (unsigned int i = 0U; i < length; ++i) {
+        files[handle->slot].content[handle->offset + i] = (char)source[i];
+    }
+    files[handle->slot].content[new_length] = '\0';
+    if (filesystem_save_change(handle->slot, &file_entry_backup) < 0) {
+        return -1;
+    }
+    handle->offset = end;
+    return (int)length;
+}
 
 void syscall_handler(struct syscall_cpu_frame *frame)
 {
@@ -3768,6 +3989,33 @@ void syscall_handler(struct syscall_cpu_frame *frame)
             }
             task_yield();
             frame->eax = 0U;
+            break;
+
+        case SYSCALL_FILE_OPEN:
+            frame->eax = (unsigned int)syscall_open_file(frame->ebx,
+                                                         frame->ecx);
+            break;
+
+        case SYSCALL_FILE_READ:
+            frame->eax = (unsigned int)syscall_read_file(frame->ebx,
+                                                         frame->ecx,
+                                                         frame->edx);
+            break;
+
+        case SYSCALL_FILE_WRITE:
+            frame->eax = (unsigned int)syscall_write_file(frame->ebx,
+                                                           frame->ecx,
+                                                           frame->edx);
+            break;
+
+        case SYSCALL_FILE_CLOSE:
+            if (frame->ebx != 0U && frame->ebx <= MAX_APP_FILE_HANDLES &&
+                app_file_handles[frame->ebx - 1U].open) {
+                app_file_handles[frame->ebx - 1U].open = 0;
+                frame->eax = 0U;
+            } else {
+                frame->eax = 0xFFFFFFFFU;
+            }
             break;
 
         case SYSCALL_EXIT:
@@ -4305,6 +4553,12 @@ static void run_stored_application(const char *app_name)
 
     embedded_app_exit_seen = 0;
     embedded_app_exit_status = 0xFFFFFFFFU;
+    for (unsigned int i = 0U; i < MAX_APP_FILE_HANDLES; ++i) {
+        app_file_handles[i].open = 0;
+        app_file_handles[i].slot = 0U;
+        app_file_handles[i].offset = 0U;
+        app_file_handles[i].flags = 0U;
+    }
     embedded_app_active = 1;
     active_user_address_space = user_address_space_directory;
     load_page_directory(user_address_space_directory);
@@ -4313,6 +4567,9 @@ static void run_stored_application(const char *app_name)
     load_page_directory(page_directory);
     active_user_address_space = 0;
     embedded_app_active = 0;
+    for (unsigned int i = 0U; i < MAX_APP_FILE_HANDLES; ++i) {
+        app_file_handles[i].open = 0;
+    }
     cleanup_user_address_space();
     __asm__ volatile ("sti");
 
@@ -4329,40 +4586,65 @@ static void run_stored_application(const char *app_name)
     }
 }
 
-static void install_sample_application(void)
+static void install_sample_application(const char *app_name)
 {
     if (!file_store_ready) {
         report_file_store_unavailable();
         return;
     }
-    if (boot_app_image_size == 0U) {
+    const unsigned char *image;
+    unsigned int image_size;
+    if (strings_equal(app_name, "hello")) {
+        image = boot_app_image;
+        image_size = boot_app_image_size;
+    } else if (strings_equal(app_name, "filedemo")) {
+        image = boot_filedemo_image;
+        image_size = boot_filedemo_image_size;
+    } else {
+        put_string("Usage: install hello|filedemo\n");
+        return;
+    }
+    if (image_size == 0U) {
         put_string("Sample ELF is unavailable from the boot ISO. Rebuild and boot the latest ISO.\n");
         return;
     }
 
     struct elf32_image_info info;
-    if (elf32_validate(boot_app_image, boot_app_image_size, &info) !=
+    if (elf32_validate(image, image_size, &info) !=
         ELF32_VALID) {
         put_string("Sample app from the boot ISO failed ELF32 validation.\n");
         return;
     }
-    if (boot_app_image_size > FILE_CONTENT_MAX / 2U) {
+    if (image_size > FILE_CONTENT_MAX / 2U) {
         put_string("Sample app is too large for the TinyOS file store.\n");
         return;
     }
 
     static const char hex_digits[] = "0123456789ABCDEF";
-    for (unsigned int i = 0U; i < boot_app_image_size; ++i) {
-        unsigned char byte = boot_app_image[i];
+    for (unsigned int i = 0U; i < image_size; ++i) {
+        unsigned char byte = image[i];
         filesystem_write_buffer[i * 2U] = hex_digits[byte >> 4];
         filesystem_write_buffer[i * 2U + 1U] = hex_digits[byte & 0x0FU];
     }
-    filesystem_write_buffer[boot_app_image_size * 2U] = '\0';
+    filesystem_write_buffer[image_size * 2U] = '\0';
 
-    const char *file_name = "hello.elf";
+    char file_name[FILENAME_MAX_LEN + 1U];
+    unsigned int name_length = string_length(app_name);
+    if (name_length == 0U || name_length + 4U > FILENAME_MAX_LEN) {
+        put_string("Invalid app name.\n");
+        return;
+    }
+    for (unsigned int i = 0U; i < name_length; ++i) {
+        file_name[i] = app_name[i];
+    }
+    file_name[name_length] = '.';
+    file_name[name_length + 1U] = 'e';
+    file_name[name_length + 2U] = 'l';
+    file_name[name_length + 3U] = 'f';
+    file_name[name_length + 4U] = '\0';
     int slot = entry_find(file_name, current_directory);
     if (slot >= 0 && files[slot].is_directory) {
-        put_string("Cannot install app: hello.elf is a directory.\n");
+        put_string("Cannot install app: destination is a directory.\n");
         return;
     }
     if (slot < 0) {
@@ -4388,8 +4670,10 @@ static void install_sample_application(void)
         put_char('\n');
         return;
     }
-    put_string("Installed hello.elf in the persistent file store (hex-encoded ");
-    put_unsigned(boot_app_image_size);
+    put_string("Installed ");
+    put_string(file_name);
+    put_string(" in the persistent file store (hex-encoded ");
+    put_unsigned(image_size);
     put_string("-byte ELF).\n");
 }
 
@@ -4508,8 +4792,9 @@ static void run_command(void)
     }
 
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello, run <app>\n");
-        put_string("Apps: install hello saves the ISO sample app to persistent storage; run <name> loads <name>.elf from the current directory.\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
+        put_string("Apps: install hello or install filedemo saves a sample ELF; run <name> loads <name>.elf from the current directory.\n");
+        put_string("App file syscalls: open(name, flags), read(handle, buffer, count), write(handle, buffer, count), close(handle). Flags: read=1, write=2, create=4, truncate=8. Each I/O call is limited to 128 bytes.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
         put_string("       touch <name>, write <name> <text>, cat <name>, rm <name>, cp <source> <destination>, df\n");
         put_string("       fscheck <file> validates disk metadata, cluster links, and file data.\n");
@@ -4528,9 +4813,11 @@ static void run_command(void)
     } else if (command_is("addrspacedemo")) {
         run_address_space_demo();
     } else if (command_is("install hello")) {
-        install_sample_application();
+        install_sample_application("hello");
+    } else if (command_is("install filedemo")) {
+        install_sample_application("filedemo");
     } else if (command_starts_with("install ")) {
-        put_string("Usage: install hello\n");
+        put_string("Usage: install hello|filedemo\n");
     } else if (command_is("run")) {
         put_string("Usage: run <app>\n");
     } else if (command_starts_with("run ")) {
@@ -5200,13 +5487,34 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
             info->mods_count != 0U && info->mods_addr != 0U) {
             const struct multiboot_module *module =
                 (const struct multiboot_module *)info->mods_addr;
-            if (module->end >= module->start &&
-                module->end - module->start <= BOOT_APP_MAX_SIZE) {
-                boot_app_image_size = module->end - module->start;
+            for (unsigned int index = 0U; index < info->mods_count; ++index) {
+                unsigned int module_size = module[index].end -
+                                           module[index].start;
+                if (module[index].end < module[index].start ||
+                    module_size > BOOT_APP_MAX_SIZE) {
+                    continue;
+                }
+                const char *module_name =
+                    (const char *)module[index].string;
+                int is_filedemo = module_name != 0 &&
+                    module_name[0] == 'f' && module_name[1] == 'i' &&
+                    module_name[2] == 'l' && module_name[3] == 'e' &&
+                    module_name[4] == 'd' && module_name[5] == 'e' &&
+                    module_name[6] == 'm' && module_name[7] == 'o' &&
+                    module_name[8] == '\0';
+                unsigned char *destination = is_filedemo
+                    ? boot_filedemo_image : boot_app_image;
+                if (is_filedemo) {
+                    boot_filedemo_image_size = module_size;
+                } else if (boot_app_image_size == 0U) {
+                    boot_app_image_size = module_size;
+                } else {
+                    continue;
+                }
                 const unsigned char *source =
-                    (const unsigned char *)module->start;
-                for (unsigned int i = 0U; i < boot_app_image_size; ++i) {
-                    boot_app_image[i] = source[i];
+                    (const unsigned char *)module[index].start;
+                for (unsigned int i = 0U; i < module_size; ++i) {
+                    destination[i] = source[i];
                 }
             }
         }

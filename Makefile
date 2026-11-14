@@ -41,6 +41,12 @@ $(BUILD_DIR)/hello_app.o: apps/hello.asm | $(BUILD_DIR)
 $(BUILD_DIR)/hello.elf: $(BUILD_DIR)/hello_app.o apps/user.ld
 	$(LD) -m elf_i386 -T apps/user.ld -nostdlib -o $@ $(BUILD_DIR)/hello_app.o
 
+$(BUILD_DIR)/filedemo_app.o: apps/filedemo.asm | $(BUILD_DIR)
+	$(AS) -f elf32 $< -o $@
+
+$(BUILD_DIR)/filedemo.elf: $(BUILD_DIR)/filedemo_app.o apps/user.ld
+	$(LD) -m elf_i386 -T apps/user.ld -nostdlib -o $@ $(BUILD_DIR)/filedemo_app.o
+
 $(BUILD_DIR)/disk.o: disk.c disk.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -54,7 +60,7 @@ $(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $
 	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o
 	grub-file --is-x86-multiboot $@
 
-iso: $(KERNEL) $(BUILD_DIR)/hello.elf grub.cfg
+iso: $(KERNEL) $(BUILD_DIR)/hello.elf $(BUILD_DIR)/filedemo.elf grub.cfg
 	set -eu; \
 	staging=$$(mktemp -d /tmp/tinyos-isodir.XXXXXX); \
 	image=$$(mktemp /tmp/tinyos-image.XXXXXX.iso); \
@@ -62,6 +68,7 @@ iso: $(KERNEL) $(BUILD_DIR)/hello.elf grub.cfg
 	mkdir -p "$$staging/boot/grub" "$$staging/boot/apps" "$(ISO_ROOT)/boot/grub" "$(ISO_ROOT)/boot/apps"; \
 	cp "$(KERNEL)" "$$staging/boot/kernel.elf"; \
 	cp "$(BUILD_DIR)/hello.elf" "$$staging/boot/apps/hello.elf"; \
+	cp "$(BUILD_DIR)/filedemo.elf" "$$staging/boot/apps/filedemo.elf"; \
 	cp grub.cfg "$$staging/boot/grub/grub.cfg"; \
 	grub-mkrescue -o "$$image" "$$staging"; \
 	xorriso -osirrox on -indev "$$image" -extract /boot/kernel.elf "$$staging/kernel.checked"; \
@@ -70,8 +77,11 @@ iso: $(KERNEL) $(BUILD_DIR)/hello.elf grub.cfg
 	cmp grub.cfg "$$staging/grub.checked"; \
 	xorriso -osirrox on -indev "$$image" -extract /boot/apps/hello.elf "$$staging/hello.checked"; \
 	cmp "$(BUILD_DIR)/hello.elf" "$$staging/hello.checked"; \
+	xorriso -osirrox on -indev "$$image" -extract /boot/apps/filedemo.elf "$$staging/filedemo.checked"; \
+	cmp "$(BUILD_DIR)/filedemo.elf" "$$staging/filedemo.checked"; \
 	cp "$(KERNEL)" "$(ISO_ROOT)/boot/kernel.elf"; \
 	cp "$(BUILD_DIR)/hello.elf" "$(ISO_ROOT)/boot/apps/hello.elf"; \
+	cp "$(BUILD_DIR)/filedemo.elf" "$(ISO_ROOT)/boot/apps/filedemo.elf"; \
 	cp grub.cfg "$(ISO_ROOT)/boot/grub/grub.cfg"; \
 	cp "$$image" "$(ISO)"
 
