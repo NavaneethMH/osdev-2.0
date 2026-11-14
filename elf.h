@@ -1,11 +1,23 @@
 #ifndef ELF_H
 #define ELF_H
 
+#define ELF32_MAX_LOAD_SEGMENTS 16U
+
+struct elf32_load_segment {
+    unsigned int offset;
+    unsigned int virtual_address;
+    unsigned int file_size;
+    unsigned int memory_size;
+    unsigned int flags;
+    unsigned int alignment;
+};
+
 struct elf32_image_info {
     unsigned int entry;
     unsigned int load_segment_count;
     unsigned int lowest_address;
     unsigned int highest_address;
+    struct elf32_load_segment segments[ELF32_MAX_LOAD_SEGMENTS];
 };
 
 enum elf32_result {
