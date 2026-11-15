@@ -30,10 +30,13 @@ $(BUILD_DIR)/boot.o: boot.asm | $(BUILD_DIR)
 $(BUILD_DIR)/interrupts.o: interrupts.asm | $(BUILD_DIR)
 	$(AS) -f elf32 $< -o $@
 
-$(BUILD_DIR)/kernel.o: kernel.c disk.h heap.h gdt.h elf.h | $(BUILD_DIR)
+$(BUILD_DIR)/kernel.o: kernel.c disk.h heap.h gdt.h elf.h pci.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/elf.o: elf.c elf.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pci.o: pci.c pci.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/hello_app.o: apps/hello.asm | $(BUILD_DIR)
@@ -57,8 +60,8 @@ $(BUILD_DIR)/heap.o: heap.c heap.h | $(BUILD_DIR)
 $(BUILD_DIR)/gdt.o: gdt.c gdt.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o linker.ld
-	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o
+$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/pci.o linker.ld
+	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/pci.o
 	grub-file --is-x86-multiboot $@
 
 iso: $(KERNEL) $(BUILD_DIR)/hello.elf $(BUILD_DIR)/filedemo.elf grub.cfg

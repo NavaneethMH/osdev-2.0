@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "gdt.h"
 #include "elf.h"
+#include "pci.h"
 
 #define SCREEN_WIDTH 80U
 #define SCREEN_HEIGHT 25U
@@ -420,6 +421,62 @@ static void put_hex32(unsigned int value)
     static const char hex[] = "0123456789ABCDEF";
     for (int shift = 28; shift >= 0; shift -= 4) {
         put_char(hex[(value >> (unsigned int)shift) & 0x0FU]);
+    }
+}
+
+static void put_hex8(unsigned char value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    put_char(hex[(value >> 4) & 0x0FU]);
+    put_char(hex[value & 0x0FU]);
+}
+
+static void put_hex16(unsigned short value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int shift = 12; shift >= 0; shift -= 4) {
+        put_char(hex[(value >> (unsigned int)shift) & 0x0FU]);
+    }
+}
+
+static void show_pci_devices(void)
+{
+    static struct pci_device_info devices[PCI_DEVICE_LIST_CAPACITY];
+    unsigned int count = pci_discover(devices, PCI_DEVICE_LIST_CAPACITY);
+    unsigned int shown = count < PCI_DEVICE_LIST_CAPACITY
+        ? count : PCI_DEVICE_LIST_CAPACITY;
+
+    put_string("PCI functions found: ");
+    put_unsigned(count);
+    put_char('\n');
+    if (count == 0U) {
+        put_string("No PCI functions were discovered.\n");
+        return;
+    }
+
+    for (unsigned int i = 0U; i < shown; ++i) {
+        put_string("PCI ");
+        put_hex8(devices[i].bus);
+        put_char(':');
+        put_hex8(devices[i].device);
+        put_char('.');
+        put_unsigned(devices[i].function);
+        put_string(" vendor=0x");
+        put_hex16(devices[i].vendor_id);
+        put_string(" device=0x");
+        put_hex16(devices[i].device_id);
+        put_string(" class=0x");
+        put_hex8(devices[i].class_code);
+        put_string(" subclass=0x");
+        put_hex8(devices[i].subclass);
+        put_string(" prog-if=0x");
+        put_hex8(devices[i].programming_interface);
+        put_char('\n');
+    }
+    if (count > shown) {
+        put_string("Output limited to the first ");
+        put_unsigned(shown);
+        put_string(" functions.\n");
     }
 }
 
@@ -4792,7 +4849,7 @@ static void run_command(void)
     }
 
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, pci, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
         put_string("Apps: install hello or install filedemo saves a sample ELF; run <name> loads <name>.elf from the current directory.\n");
         put_string("App file syscalls: open(name, flags), read(handle, buffer, count), write(handle, buffer, count), close(handle). Flags: read=1, write=2, create=4, truncate=8. Each I/O call is limited to 128 bytes.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
@@ -4841,6 +4898,8 @@ static void run_command(void)
         put_string(" seconds\n");
     } else if (command_is("about")) {
         put_string("TinyOS is a small educational operating system.\n");
+    } else if (command_is("pci")) {
+        show_pci_devices();
     } else if (command_is("meminfo")) {
         show_memory_info();
     } else if (command_is("mmap")) {
