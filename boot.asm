@@ -3,8 +3,13 @@ BITS 32
 section .multiboot
 align 4
     dd 0x1BADB002
-    dd 0x00000003
-    dd -(0x1BADB002 + 0x00000003)
+    ; Request page-aligned modules, memory information, and a graphics mode.
+    dd 0x00000007
+    dd -(0x1BADB002 + 0x00000007)
+    dd 0                    ; linear graphics mode
+    dd 1024                 ; requested width
+    dd 768                  ; requested height
+    dd 32                   ; requested color depth
 
 section .bss
 align 16
@@ -28,3 +33,4 @@ _start:
     cli
     hlt
     jmp .hang
+

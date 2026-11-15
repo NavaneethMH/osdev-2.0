@@ -10,12 +10,14 @@
 #include "pic.h"
 #include "serial.h"
 #include "mouse.h"
+#include "framebuffer.h"
 
 #define PAGE_SIZE 4096U
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002U
 #define MULTIBOOT_INFO_MEMORY 0x00000001U
 #define MULTIBOOT_INFO_MODULES 0x00000008U
 #define MULTIBOOT_INFO_MEMORY_MAP 0x00000040U
+#define MULTIBOOT_INFO_FRAMEBUFFER 0x00001000U
 #define MAX_MEMORY_REGIONS 32U
 #define MAX_TRACKED_PAGES 256U
 #define PAGING_MAPPED_LIMIT 0x02000000U /* First 32 MiB identity-mapped. */
@@ -72,7 +74,39 @@ struct multiboot_info {
     unsigned int symbols[4];
     unsigned int mmap_length;
     unsigned int mmap_addr;
+    unsigned int drives_length;
+    unsigned int drives_addr;
+    unsigned int config_table;
+    unsigned int boot_loader_name;
+    unsigned int apm_table;
+    unsigned int vbe_control_info;
+    unsigned int vbe_mode_info;
+    unsigned short vbe_mode;
+    unsigned short vbe_interface_segment;
+    unsigned short vbe_interface_offset;
+    unsigned short vbe_interface_length;
+    unsigned int framebuffer_addr_low;
+    unsigned int framebuffer_addr_high;
+    unsigned int framebuffer_pitch;
+    unsigned int framebuffer_width;
+    unsigned int framebuffer_height;
+    unsigned char framebuffer_bits_per_pixel;
+    unsigned char framebuffer_type;
+    unsigned short framebuffer_reserved;
+    unsigned char framebuffer_red_position;
+    unsigned char framebuffer_red_size;
+    unsigned char framebuffer_green_position;
+    unsigned char framebuffer_green_size;
+    unsigned char framebuffer_blue_position;
+    unsigned char framebuffer_blue_size;
 };
+
+_Static_assert(__builtin_offsetof(struct multiboot_info,
+                                  framebuffer_addr_low) == 88U,
+               "Multiboot framebuffer address offset must match the spec");
+_Static_assert(__builtin_offsetof(struct multiboot_info,
+                                  framebuffer_red_position) == 112U,
+               "Multiboot RGB field offset must match the spec");
 
 struct multiboot_module {
     unsigned int start;
@@ -158,6 +192,7 @@ static struct memory_region memory_regions[MAX_MEMORY_REGIONS];
 static unsigned int memory_region_count = 0;
 static int memory_map_available = 0;
 static int memory_map_truncated = 0;
+static struct framebuffer_info boot_framebuffer;
 static struct page_range page_ranges[MAX_MEMORY_REGIONS];
 static unsigned int page_range_count = 0;
 static unsigned int current_range = 0;
@@ -463,6 +498,47 @@ static void show_mouse_info(void)
     put_unsigned(state.right_presses);
     put_string(" middle=");
     put_unsigned(state.middle_presses);
+    put_char('\n');
+}
+
+static void show_framebuffer_info(void)
+{
+    put_string("Framebuffer: ");
+    put_string(framebuffer_status_name(boot_framebuffer.status));
+    put_char('\n');
+    if (boot_framebuffer.status != FRAMEBUFFER_VALID) {
+        return;
+    }
+
+    put_string("Address: 0x");
+    put_hex32(boot_framebuffer.address_low);
+    put_string("  Dimensions: ");
+    put_unsigned(boot_framebuffer.width);
+    put_char('x');
+    put_unsigned(boot_framebuffer.height);
+    put_string("  Pitch: ");
+    put_unsigned(boot_framebuffer.pitch);
+    put_string(" bytes  Pixel depth: ");
+    put_unsigned(boot_framebuffer.bits_per_pixel);
+    put_string(" bpp\nRGB masks (position:size): ");
+    put_unsigned(boot_framebuffer.red_position);
+    put_char(':');
+    put_unsigned(boot_framebuffer.red_size);
+    put_string(" ");
+    put_unsigned(boot_framebuffer.green_position);
+    put_char(':');
+    put_unsigned(boot_framebuffer.green_size);
+    put_string(" ");
+    put_unsigned(boot_framebuffer.blue_position);
+    put_char(':');
+    put_unsigned(boot_framebuffer.blue_size);
+    put_string("\nValidated bytes: ");
+    put_unsigned(boot_framebuffer.byte_length_low);
+    if (boot_framebuffer.byte_length_high != 0U) {
+        put_string(" (high word ");
+        put_unsigned(boot_framebuffer.byte_length_high);
+        put_char(')');
+    }
     put_char('\n');
 }
 
@@ -4684,7 +4760,7 @@ static void run_command(void)
     }
 
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, pci, mouseinfo, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, pci, mouseinfo, fbinfo, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
         put_string("Apps: install hello or install filedemo saves a sample ELF; run <name> loads <name>.elf from the current directory.\n");
         put_string("App file syscalls: open(name, flags), read(handle, buffer, count), write(handle, buffer, count), close(handle). Flags: read=1, write=2, create=4, truncate=8. Each I/O call is limited to 128 bytes.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
@@ -4737,6 +4813,8 @@ static void run_command(void)
         show_pci_devices();
     } else if (command_is("mouseinfo")) {
         show_mouse_info();
+    } else if (command_is("fbinfo")) {
+        show_framebuffer_info();
     } else if (command_is("meminfo")) {
         show_memory_info();
     } else if (command_is("mmap")) {
@@ -5416,7 +5494,26 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
             info->mmap_addr != 0U && info->mmap_length != 0U) {
             capture_memory_map(info->mmap_addr, info->mmap_length);
         }
+        if ((info->flags & MULTIBOOT_INFO_FRAMEBUFFER) != 0U) {
+            boot_framebuffer.address_low = info->framebuffer_addr_low;
+            boot_framebuffer.address_high = info->framebuffer_addr_high;
+            boot_framebuffer.pitch = info->framebuffer_pitch;
+            boot_framebuffer.width = info->framebuffer_width;
+            boot_framebuffer.height = info->framebuffer_height;
+            boot_framebuffer.bits_per_pixel =
+                info->framebuffer_bits_per_pixel;
+            boot_framebuffer.memory_model = info->framebuffer_type;
+            boot_framebuffer.red_position = info->framebuffer_red_position;
+            boot_framebuffer.red_size = info->framebuffer_red_size;
+            boot_framebuffer.green_position =
+                info->framebuffer_green_position;
+            boot_framebuffer.green_size = info->framebuffer_green_size;
+            boot_framebuffer.blue_position = info->framebuffer_blue_position;
+            boot_framebuffer.blue_size = info->framebuffer_blue_size;
+            boot_framebuffer.available = 1U;
+        }
     }
+    boot_framebuffer.status = framebuffer_validate(&boot_framebuffer);
 
     initialize_page_allocator();
     gdt_initialize();
@@ -5440,6 +5537,7 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
     }
     put_string(mouse_result ? "PS/2 mouse ready on IRQ 12.\n"
                             : "PS/2 mouse unavailable.\n");
+    show_framebuffer_info();
     show_prompt();
 
     /* Enable interrupts so timer, keyboard, and mouse drivers can run. */
