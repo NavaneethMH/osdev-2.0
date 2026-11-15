@@ -8,6 +8,7 @@
 #include "keyboard.h"
 #include "timer.h"
 #include "pic.h"
+#include "serial.h"
 
 #define PAGE_SIZE 4096U
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002U
@@ -333,6 +334,7 @@ static void clear_screen(void)
 static void put_char(char character)
 {
     display_put_char(character);
+    serial_write_char(character);
 }
 
 static void put_string(const char *text)
@@ -5320,6 +5322,8 @@ static void run_command(void)
 
 void kernel_main(unsigned int boot_magic, unsigned int info_address)
 {
+    serial_initialize();
+
     if (boot_magic == MULTIBOOT_BOOTLOADER_MAGIC && info_address != 0U) {
         const struct multiboot_info *info =
             (const struct multiboot_info *)info_address;
