@@ -9,6 +9,7 @@
 #include "timer.h"
 #include "pic.h"
 #include "serial.h"
+#include "mouse.h"
 
 #define PAGE_SIZE 4096U
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002U
@@ -364,6 +365,16 @@ static void put_unsigned(unsigned int value)
     }
 }
 
+static void put_signed(int value)
+{
+    if (value < 0) {
+        put_char('-');
+        put_unsigned((unsigned int)(-value));
+    } else {
+        put_unsigned((unsigned int)value);
+    }
+}
+
 static void put_hex32(unsigned int value)
 {
     static const char hex[] = "0123456789ABCDEF";
@@ -426,6 +437,33 @@ static void show_pci_devices(void)
         put_unsigned(shown);
         put_string(" functions.\n");
     }
+}
+
+static void show_mouse_info(void)
+{
+    struct mouse_state state;
+    mouse_get_state(&state);
+    put_string("PS/2 mouse: ");
+    put_string(state.available ? "ready\n" : "unavailable\n");
+    put_string("Packets received: ");
+    put_unsigned(state.packets);
+    put_string("\nRelative X: ");
+    put_signed(state.relative_x);
+    put_string("\nRelative Y: ");
+    put_signed(state.relative_y);
+    put_string("\nButtons: left=");
+    put_unsigned((state.buttons & 0x01U) != 0U);
+    put_string(" right=");
+    put_unsigned((state.buttons & 0x02U) != 0U);
+    put_string(" middle=");
+    put_unsigned((state.buttons & 0x04U) != 0U);
+    put_string("\nButton presses: left=");
+    put_unsigned(state.left_presses);
+    put_string(" right=");
+    put_unsigned(state.right_presses);
+    put_string(" middle=");
+    put_unsigned(state.middle_presses);
+    put_char('\n');
 }
 
 static const char *task_state_name(enum task_state state)
@@ -3509,6 +3547,11 @@ unsigned int irq_handler(unsigned int irq_vector,
             pic_send_eoi(irq_vector);
             break;
 
+        case 44: /* IRQ12: PS/2 mouse */
+            mouse_handle_interrupt();
+            pic_send_eoi(irq_vector);
+            break;
+
         default:
             pic_send_eoi(irq_vector);
             break;
@@ -4641,7 +4684,7 @@ static void run_command(void)
     }
 
     if (command_is("help")) {
-        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, pci, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
+        put_string("Commands: help, about, taskinfo, taskdemo, sleepdemo, preemptdemo, meminfo, mmap, pages, paging, vminfo, vmtest, pfdemo, heapinfo, heapcheck, heapdemo, alloc, free [address], uptime, pci, mouseinfo, diskinfo, fsinfo, disktest, df, fscheck <file>, fsck, fsbounds, clear, echo <text>, ring3demo, syscalldemo, usermemdemo, elfdemo, addrspacedemo, install hello|filedemo, run <app>\n");
         put_string("Apps: install hello or install filedemo saves a sample ELF; run <name> loads <name>.elf from the current directory.\n");
         put_string("App file syscalls: open(name, flags), read(handle, buffer, count), write(handle, buffer, count), close(handle). Flags: read=1, write=2, create=4, truncate=8. Each I/O call is limited to 128 bytes.\n");
         put_string("Files: ls, mkdir <name>, cd <name|..|/>, pwd, rmdir <name>, rename <old> <new>\n");
@@ -4692,6 +4735,8 @@ static void run_command(void)
         put_string("TinyOS is a small educational operating system.\n");
     } else if (command_is("pci")) {
         show_pci_devices();
+    } else if (command_is("mouseinfo")) {
+        show_mouse_info();
     } else if (command_is("meminfo")) {
         show_memory_info();
     } else if (command_is("mmap")) {
@@ -5379,6 +5424,7 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
     /* Install the IDT first so a page fault during paging setup is
        reported cleanly instead of triple-faulting. */
     initialize_idt();
+    int mouse_result = mouse_initialize();
     initialize_paging();
     initialize_task_model();
     (void)heap_initialize();
@@ -5392,9 +5438,11 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         put_string(file_store_error_message(file_store_result));
         put_string(".\n");
     }
+    put_string(mouse_result ? "PS/2 mouse ready on IRQ 12.\n"
+                            : "PS/2 mouse unavailable.\n");
     show_prompt();
 
-    /* Enable interrupts so the timer and keyboard drivers can run. */
+    /* Enable interrupts so timer, keyboard, and mouse drivers can run. */
     __asm__ volatile ("sti");
 
     for (;;) {

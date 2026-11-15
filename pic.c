@@ -15,8 +15,9 @@ void pic_initialize(void)
     outb(0xA1U, 0x02U);
     outb(0x21U, 0x01U);
     outb(0xA1U, 0x01U);
-    outb(0x21U, 0xFCU);
-    outb(0xA1U, 0xFFU);
+    /* IRQ0/1 plus the IRQ2 cascade; enable only IRQ12 on the slave PIC. */
+    outb(0x21U, 0xF8U);
+    outb(0xA1U, 0xEFU);
 }
 
 void pic_send_eoi(unsigned int irq_vector)

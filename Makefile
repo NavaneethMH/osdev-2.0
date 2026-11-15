@@ -30,7 +30,7 @@ $(BUILD_DIR)/boot.o: boot.asm | $(BUILD_DIR)
 $(BUILD_DIR)/interrupts.o: interrupts.asm | $(BUILD_DIR)
 	$(AS) -f elf32 $< -o $@
 
-$(BUILD_DIR)/kernel.o: kernel.c block.h disk.h heap.h gdt.h elf.h pci.h display.h keyboard.h timer.h pic.h serial.h | $(BUILD_DIR)
+$(BUILD_DIR)/kernel.o: kernel.c block.h disk.h heap.h gdt.h elf.h pci.h display.h keyboard.h timer.h pic.h serial.h mouse.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/block.o: block.c block.h disk.h | $(BUILD_DIR)
@@ -49,6 +49,9 @@ $(BUILD_DIR)/pic.o: pic.c pic.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/serial.o: serial.c serial.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mouse.o: mouse.c mouse.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/elf.o: elf.c elf.h | $(BUILD_DIR)
@@ -78,8 +81,8 @@ $(BUILD_DIR)/heap.o: heap.c heap.h | $(BUILD_DIR)
 $(BUILD_DIR)/gdt.o: gdt.c gdt.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/block.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/display.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/timer.o $(BUILD_DIR)/pic.o $(BUILD_DIR)/serial.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/pci.o linker.ld
-	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/block.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/display.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/timer.o $(BUILD_DIR)/pic.o $(BUILD_DIR)/serial.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/pci.o
+$(KERNEL): $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/block.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/display.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/timer.o $(BUILD_DIR)/pic.o $(BUILD_DIR)/serial.o $(BUILD_DIR)/mouse.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/pci.o linker.ld
+	$(LD) -m elf_i386 -T linker.ld -nostdlib -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/kernel.o $(BUILD_DIR)/block.o $(BUILD_DIR)/disk.o $(BUILD_DIR)/display.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/timer.o $(BUILD_DIR)/pic.o $(BUILD_DIR)/serial.o $(BUILD_DIR)/mouse.o $(BUILD_DIR)/heap.o $(BUILD_DIR)/gdt.o $(BUILD_DIR)/elf.o $(BUILD_DIR)/pci.o
 	grub-file --is-x86-multiboot $@
 
 iso: $(KERNEL) $(BUILD_DIR)/hello.elf $(BUILD_DIR)/filedemo.elf grub.cfg

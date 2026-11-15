@@ -96,6 +96,8 @@ Stage 6, Milestone 2 test: rebuild the combined ISO with `make clean && make iso
 
 Stage 6, Milestone 3 test: build the combined ISO with `make clean && make iso`, then run `make serial-run`. The QEMU display remains available while COM1 output is mirrored to the launching terminal. Confirm that the TinyOS banner, file-store status, prompt, and output from commands such as `about`, `uptime`, `pci`, and `fsck` appear in the terminal as well as the VGA display. To check diagnostics without the graphical display, launch QEMU with `-display none -serial stdio` using the same ISO and disk arguments; boot and shell startup text should remain visible in the terminal. The serial driver probes COM1, configures 115200 baud, and drops output after a bounded transmit wait so a missing UART cannot hang the kernel. Stage 6, Milestone 3 is complete and verified in VirtualBox/QEMU.
 
+Stage 6, Milestone 4 test: rebuild with `make clean && make iso` and boot the combined ISO in QEMU with the normal display and a PS/2 mouse enabled. The startup line should report `PS/2 mouse ready on IRQ 12.` Run `mouseinfo` and record the packet count, relative coordinates, and button press counts. Move the pointer inside the QEMU guest window, then run `mouseinfo` again; packet count and relative X/Y should change. Click and release the left and right buttons, then run `mouseinfo` after each; the corresponding press counters should increase. Keyboard commands such as `uptime`, `help`, and `fsck` should remain responsive, and `fsck` should still report a clean filesystem. This milestone records mouse packets in the driver and reports state through the shell; it does not draw a pointer yet. Stage 6, Milestone 4 is complete and verified in VirtualBox.
+
 To check renaming, run `write draft keep this text`, `df`, `rename draft final`, `cat final`, and `df` again; the content should remain and cluster usage should not change. `cat draft` should report that the old name is missing. Create a directory with `mkdir olddir`, rename it with `rename olddir newdir`, then run `cd newdir` and `pwd`; the path should show `/newdir`. Try `rename final newdir` to confirm an existing destination name is refused. Restart TinyOS and run `cat final` to confirm the new name persists.
 
 To check copying, run `write original copy this text`, `cp original duplicate`, `cat original`, and `cat duplicate`; both should show the same contents. Run `write duplicate changed` and confirm `cat original` still shows the original text. Try `cp original duplicate` again to check that an existing destination is not overwritten. Restart TinyOS and run `cat duplicate` to confirm the copy persisted independently.
@@ -172,6 +174,7 @@ For Stage 2, Milestone 1, run `taskinfo` at the TinyOS prompt. It should report 
 38. (Stage 6, Milestone 1 — Complete; verified in VirtualBox) Add PCI device discovery and report vendor/device identifiers.
 39. (Stage 6, Milestone 2 — Complete; verified in VirtualBox) Create small driver interfaces for block, keyboard, display, and timer devices.
 40. (Stage 6, Milestone 3 — Complete; verified in VirtualBox/QEMU) Add serial output for boot and kernel diagnostics.
+41. (Stage 6, Milestone 4 — Complete; verified in VirtualBox) Add a mouse driver after keyboard and interrupt handling are dependable.
 
 ## License
 
