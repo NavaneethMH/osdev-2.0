@@ -1,13 +1,14 @@
 /* TinyOS: a small freestanding x86 kernel for learning in QEMU. */
-#include "disk.h"
+#include "block.h"
 #include "heap.h"
 #include "gdt.h"
 #include "elf.h"
 #include "pci.h"
+#include "display.h"
+#include "keyboard.h"
+#include "timer.h"
+#include "pic.h"
 
-#define SCREEN_WIDTH 80U
-#define SCREEN_HEIGHT 25U
-#define SCREEN_CELLS (SCREEN_WIDTH * SCREEN_HEIGHT)
 #define PAGE_SIZE 4096U
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002U
 #define MULTIBOOT_INFO_MEMORY 0x00000001U
@@ -15,7 +16,6 @@
 #define MULTIBOOT_INFO_MEMORY_MAP 0x00000040U
 #define MAX_MEMORY_REGIONS 32U
 #define MAX_TRACKED_PAGES 256U
-#define KEYBOARD_BUFFER_SIZE 256U
 #define PAGING_MAPPED_LIMIT 0x02000000U /* First 32 MiB identity-mapped. */
 #define VM_DYNAMIC_TABLES 8U
 #define VM_TEST_VIRTUAL_ADDRESS 0x40000000U
@@ -147,8 +147,6 @@ extern void ring3_protection_demo_user(void);
 extern unsigned char ring3_syscall_message[];
 extern unsigned char ring3_syscall_message_end[];
 
-static volatile unsigned short *const video = (volatile unsigned short *)0xB8000;
-static unsigned int cursor = 0;
 static char command[COMMAND_MAX];
 static unsigned int command_length = 0;
 static unsigned int memory_lower_kib = 0;
@@ -168,20 +166,6 @@ static unsigned int released_pages[MAX_TRACKED_PAGES];
 static unsigned int released_page_count = 0;
 static unsigned int kernel_end_address = 0;
 static int page_allocator_available = 0;
-
-/* Timer state */
-static volatile unsigned int timer_ticks = 0; /* Incremented by IRQ0 */
-static volatile unsigned int timer_uptime_seconds = 0; /* Seconds since boot */
-static unsigned int timer_ticks_in_second = 0U;
-
-/* Keyboard state: ring buffer filled by the IRQ1 handler, drained by the shell. */
-static volatile char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
-static volatile unsigned int keyboard_head = 0; /* Next slot to write (producer). */
-static volatile unsigned int keyboard_tail = 0; /* Next slot to read (consumer). */
-static volatile unsigned int keyboard_count = 0; /* Characters currently buffered. */
-static volatile int keyboard_left_shift_down = 0;
-static volatile int keyboard_right_shift_down = 0;
-static volatile int keyboard_caps_lock = 0;
 
 /* Paging state.
    32 MiB = 8 page tables (each 4 MiB = 1024 * 4 KiB). */
@@ -341,52 +325,14 @@ static int file_store_error = 0;
 static unsigned char current_directory = FILE_PARENT_ROOT;
 static void report_file_store_unavailable(void);
 
-/* I/O port functions */
-static void outb(unsigned short port, unsigned char value)
-{
-    __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
-}
-
-static void scroll_if_needed(void)
-{
-    if (cursor < SCREEN_CELLS) {
-        return;
-    }
-
-    for (unsigned int i = 0; i < SCREEN_WIDTH * (SCREEN_HEIGHT - 1U); ++i) {
-        video[i] = video[i + SCREEN_WIDTH];
-    }
-
-    for (unsigned int i = SCREEN_WIDTH * (SCREEN_HEIGHT - 1U); i < SCREEN_CELLS; ++i) {
-        video[i] = (unsigned short)(0x0F00 | ' ');
-    }
-
-    cursor = SCREEN_WIDTH * (SCREEN_HEIGHT - 1U);
-}
-
 static void clear_screen(void)
 {
-    for (unsigned int i = 0; i < SCREEN_CELLS; ++i) {
-        video[i] = (unsigned short)(0x0F00 | ' ');
-    }
-    cursor = 0;
+    display_clear();
 }
 
 static void put_char(char character)
 {
-    if (character == '\n') {
-        cursor = (cursor / SCREEN_WIDTH + 1U) * SCREEN_WIDTH;
-    } else if (character == '\b') {
-        if (cursor > 0) {
-            --cursor;
-            video[cursor] = (unsigned short)(0x0F00 | ' ');
-        }
-    } else {
-        video[cursor] = (unsigned short)(0x0F00 | (unsigned char)character);
-        ++cursor;
-    }
-
-    scroll_if_needed();
+    display_put_char(character);
 }
 
 static void put_string(const char *text)
@@ -632,7 +578,7 @@ static void task_sleep_ticks(unsigned int ticks)
 
     unsigned int flags = save_and_disable_interrupts();
     unsigned int id = current_task_id;
-    tasks[id].wake_tick = timer_ticks + ticks;
+    tasks[id].wake_tick = timer_ticks() + ticks;
     tasks[id].state = TASK_BLOCKED;
     restore_interrupts(flags);
     task_yield();
@@ -759,7 +705,7 @@ static void process_sleep_wakeups(void)
         return;
     }
     task_wakeup_pending = 0;
-    now = timer_ticks;
+    now = timer_ticks();
     for (unsigned int i = 0U; i < MAX_TASKS; ++i) {
         if (tasks[i].state == TASK_BLOCKED &&
             (unsigned int)(now - tasks[i].wake_tick) < 0x80000000U) {
@@ -810,8 +756,8 @@ static int task_reap(unsigned int id)
 static void task_preempt_worker_a(void)
 {
     for (unsigned int step = 1U; step <= 3U; ++step) {
-        unsigned int start = timer_ticks;
-        while ((unsigned int)(timer_ticks - start) < 4U) {
+        unsigned int start = timer_ticks();
+        while ((unsigned int)(timer_ticks() - start) < 4U) {
             __asm__ volatile ("pause");
         }
         unsigned int flags = save_and_disable_interrupts();
@@ -825,8 +771,8 @@ static void task_preempt_worker_a(void)
 static void task_preempt_worker_b(void)
 {
     for (unsigned int step = 1U; step <= 3U; ++step) {
-        unsigned int start = timer_ticks;
-        while ((unsigned int)(timer_ticks - start) < 4U) {
+        unsigned int start = timer_ticks();
+        while ((unsigned int)(timer_ticks() - start) < 4U) {
             __asm__ volatile ("pause");
         }
         unsigned int flags = save_and_disable_interrupts();
@@ -1672,69 +1618,6 @@ static void run_vm_test(void)
     }
 }
 
-static unsigned char inb(unsigned short port)
-{
-    unsigned char value;
-    __asm__ volatile ("inb %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
-static char key_from_scancode(unsigned char code, int shifted, int caps_lock)
-{
-    char character;
-    switch (code) {
-        case 0x02: character = '1'; break; case 0x03: character = '2'; break;
-        case 0x04: character = '3'; break; case 0x05: character = '4'; break;
-        case 0x06: character = '5'; break; case 0x07: character = '6'; break;
-        case 0x08: character = '7'; break; case 0x09: character = '8'; break;
-        case 0x0A: character = '9'; break; case 0x0B: character = '0'; break;
-        case 0x0C: character = '-'; break; case 0x0D: character = '='; break;
-        case 0x0E: return '\b'; /* Backspace */
-        case 0x10: character = 'q'; break; case 0x11: character = 'w'; break;
-        case 0x12: character = 'e'; break; case 0x13: character = 'r'; break;
-        case 0x14: character = 't'; break; case 0x15: character = 'y'; break;
-        case 0x16: character = 'u'; break; case 0x17: character = 'i'; break;
-        case 0x18: character = 'o'; break; case 0x19: character = 'p'; break;
-        case 0x1A: character = '['; break; case 0x1B: character = ']'; break;
-        case 0x1C: return '\n'; /* Enter */
-        case 0x1E: character = 'a'; break; case 0x1F: character = 's'; break;
-        case 0x20: character = 'd'; break; case 0x21: character = 'f'; break;
-        case 0x22: character = 'g'; break; case 0x23: character = 'h'; break;
-        case 0x24: character = 'j'; break; case 0x25: character = 'k'; break;
-        case 0x26: character = 'l'; break; case 0x27: character = ';'; break;
-        case 0x28: character = '\''; break; case 0x29: character = '`'; break;
-        case 0x2B: character = '\\'; break; case 0x2C: character = 'z'; break;
-        case 0x2D: character = 'x'; break; case 0x2E: character = 'c'; break;
-        case 0x2F: character = 'v'; break; case 0x30: character = 'b'; break;
-        case 0x31: character = 'n'; break; case 0x32: character = 'm'; break;
-        case 0x33: character = ','; break; case 0x34: character = '.'; break;
-        case 0x35: character = '/'; break; case 0x39: character = ' '; break;
-        default: return '\0';
-    }
-
-    if (character >= 'a' && character <= 'z') {
-        if (shifted != caps_lock) {
-            return (char)(character - 'a' + 'A');
-        }
-        return character;
-    }
-
-    if (!shifted) {
-        return character;
-    }
-
-    switch (code) {
-        case 0x02: return '!'; case 0x03: return '@'; case 0x04: return '#';
-        case 0x05: return '$'; case 0x06: return '%'; case 0x07: return '^';
-        case 0x08: return '&'; case 0x09: return '*'; case 0x0A: return '(';
-        case 0x0B: return ')'; case 0x0C: return '_'; case 0x0D: return '+';
-        case 0x1A: return '{'; case 0x1B: return '}'; case 0x27: return ':';
-        case 0x28: return '"'; case 0x29: return '~'; case 0x2B: return '|';
-        case 0x33: return '<'; case 0x34: return '>'; case 0x35: return '?';
-        default: return character;
-    }
-}
-
 static int command_is(const char *expected)
 {
     unsigned int i = 0;
@@ -1930,7 +1813,7 @@ static unsigned int filesystem_cluster_lba(unsigned short cluster)
 
 static int filesystem_load_fat(void)
 {
-    int result = disk_read_sectors(FILESYSTEM_FAT_LBA,
+    int result = block_read_sectors(FILESYSTEM_FAT_LBA,
                                    FILESYSTEM_FAT_SECTORS,
                                    filesystem_fat_disk);
     if (result < 0) {
@@ -1969,7 +1852,7 @@ static int filesystem_write_fat(void)
         filesystem_fat_disk[i * 2U + 1U] =
             (unsigned char)((filesystem_fat[i] >> 8) & 0xFFU);
     }
-    int result = disk_write_sectors(FILESYSTEM_FAT_LBA,
+    int result = block_write_sectors(FILESYSTEM_FAT_LBA,
                                     FILESYSTEM_FAT_SECTORS,
                                     filesystem_fat_disk);
     return result < 0 ? result : 0;
@@ -2113,7 +1996,7 @@ static int filesystem_write_data_chain(unsigned short first_cluster,
         for (unsigned int i = 0; i < bytes_here; ++i) {
             filesystem_fat_disk[i] = (unsigned char)content[offset + i];
         }
-        int result = disk_write_sectors(filesystem_cluster_lba(cluster), 1U,
+        int result = block_write_sectors(filesystem_cluster_lba(cluster), 1U,
                                         filesystem_fat_disk);
         if (result < 0) {
             return result;
@@ -2177,7 +2060,7 @@ static int filesystem_read_data_chain(unsigned short first_cluster,
             return FILESYSTEM_CORRUPT_ERROR;
         }
         filesystem_cluster_seen[cluster] = 1U;
-        int result = disk_read_sectors(filesystem_cluster_lba(cluster), 1U,
+        int result = block_read_sectors(filesystem_cluster_lba(cluster), 1U,
                                        filesystem_fat_disk);
         if (result < 0) {
             return result;
@@ -2308,7 +2191,7 @@ static int filesystem_write_directory(void)
         sector[offset + 24U] = (unsigned char)(files[slot].cluster_count >> 8);
     }
 
-    int result = disk_write_sectors(FILESYSTEM_DIRECTORY_LBA, 1U, sector);
+    int result = block_write_sectors(FILESYSTEM_DIRECTORY_LBA, 1U, sector);
     return result < 0 ? result : 1;
 }
 
@@ -2418,7 +2301,7 @@ static int filesystem_check_zero_range(unsigned int first_lba,
         if (count > 32U) {
             count = 32U;
         }
-        int result = disk_read_sectors(lba, count, filesystem_scan_buffer);
+        int result = block_read_sectors(lba, count, filesystem_scan_buffer);
         if (result < 0) {
             return result;
         }
@@ -2445,7 +2328,7 @@ static int initialize_file_store(void)
     unsigned char superblock[DISK_SECTOR_SIZE];
     unsigned char directory[DISK_SECTOR_SIZE];
     unsigned char data_sector[DISK_SECTOR_SIZE];
-    int result = disk_read_sectors(FILESYSTEM_SUPER_LBA, 1U, superblock);
+    int result = block_read_sectors(FILESYSTEM_SUPER_LBA, 1U, superblock);
     if (result < 0) {
         file_store_error = result;
         return result;
@@ -2474,13 +2357,13 @@ static int initialize_file_store(void)
             file_store_error = result;
             return result;
         }
-        result = disk_write_sectors(FILESYSTEM_DIRECTORY_LBA, 1U, directory);
+        result = block_write_sectors(FILESYSTEM_DIRECTORY_LBA, 1U, directory);
         if (result < 0) {
             file_store_error = result;
             return result;
         }
         filesystem_make_superblock(superblock);
-        result = disk_write_sectors(FILESYSTEM_SUPER_LBA, 1U, superblock);
+        result = block_write_sectors(FILESYSTEM_SUPER_LBA, 1U, superblock);
         if (result < 0) {
             file_store_error = result;
             return result;
@@ -2506,7 +2389,7 @@ static int initialize_file_store(void)
         }
     }
 
-    result = disk_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U, directory);
+    result = block_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U, directory);
     if (result < 0) {
         file_store_error = result;
         return result;
@@ -2662,7 +2545,7 @@ static int initialize_file_store(void)
             unsigned int content_offset = 0U;
             unsigned int file_sector = 0U;
             while (remaining > 0U) {
-                result = disk_read_sectors(
+                result = block_read_sectors(
                     legacy_filesystem_data_lba(slot, file_sector), 1U,
                     data_sector);
                 if (result < 0) {
@@ -2739,7 +2622,7 @@ static int initialize_file_store(void)
             return result;
         }
         superblock[8] = FILESYSTEM_VERSION;
-        result = disk_write_sectors(FILESYSTEM_SUPER_LBA, 1U, superblock);
+        result = block_write_sectors(FILESYSTEM_SUPER_LBA, 1U, superblock);
         if (result < 0) {
             file_store_error = result;
             return result;
@@ -2775,7 +2658,7 @@ static const char *file_store_error_message(int error)
     if (error == FILESYSTEM_FULL_ERROR) {
         return "disk is full; no free data clusters are available";
     }
-    return disk_error_string(error);
+    return block_error_string(error);
 }
 
 static void show_filesystem_space(void)
@@ -2809,11 +2692,11 @@ static void inspect_file_chain(unsigned int slot)
     file = &files[slot];
     unsigned int expected_count = length == 0U ? 0U :
         (length + DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
-    int result = disk_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U,
+    int result = block_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U,
                                    filesystem_scan_buffer);
     if (result < 0) {
         put_string("Filesystem check could not read directory: ");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
@@ -2843,11 +2726,11 @@ static void inspect_file_chain(unsigned int slot)
         }
     }
 
-    result = disk_read_sectors(FILESYSTEM_FAT_LBA, FILESYSTEM_FAT_SECTORS,
+    result = block_read_sectors(FILESYSTEM_FAT_LBA, FILESYSTEM_FAT_SECTORS,
                                filesystem_fat_disk);
     if (result < 0) {
         put_string("Filesystem check could not read allocation map: ");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
@@ -2929,11 +2812,11 @@ static void inspect_file_chain(unsigned int slot)
             }
         }
 
-        result = disk_read_sectors(filesystem_cluster_lba(cluster), 1U,
+        result = block_read_sectors(filesystem_cluster_lba(cluster), 1U,
                                    filesystem_fat_disk);
         if (result < 0) {
             put_string("\nFilesystem check could not read file data: ");
-            put_string(disk_error_string(result));
+            put_string(block_error_string(result));
             put_char('\n');
             return;
         }
@@ -3077,11 +2960,11 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
     summary->orphans = 0U;
     summary->scan_complete = 0;
 
-    int result = disk_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U,
+    int result = block_read_sectors(FILESYSTEM_DIRECTORY_LBA, 1U,
                                    filesystem_scan_buffer);
     if (result < 0) {
         filesystem_audit_error(summary, "could not read the directory sector.");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
@@ -3176,12 +3059,12 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
         }
     }
 
-    result = disk_read_sectors(FILESYSTEM_FAT_LBA, FILESYSTEM_FAT_SECTORS,
+    result = block_read_sectors(FILESYSTEM_FAT_LBA, FILESYSTEM_FAT_SECTORS,
                                filesystem_fat_disk);
     if (result < 0) {
         filesystem_audit_error(summary,
                                "could not read the allocation map.");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
@@ -3275,12 +3158,12 @@ static void filesystem_run_audit(struct filesystem_audit_summary *summary)
                 break;
             }
 
-            result = disk_read_sectors(filesystem_cluster_lba(cluster), 1U,
+            result = block_read_sectors(filesystem_cluster_lba(cluster), 1U,
                                        filesystem_fat_disk);
             if (result < 0) {
                 filesystem_audit_error(summary,
                                        "could not read a file data sector.");
-                put_string(disk_error_string(result));
+                put_string(block_error_string(result));
                 put_char('\n');
                 content_offset = lengths[slot];
                 break;
@@ -3387,7 +3270,7 @@ static void run_filesystem_repair_preview(int confirm)
     if (result < 0) {
         int reload_result = filesystem_load_fat();
         put_string("Repair write failed: ");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         if (reload_result < 0) {
             file_store_ready = 0;
@@ -3459,10 +3342,10 @@ static void run_filesystem_bounds_demo(void)
     for (unsigned int i = 0U; i < DISK_SECTOR_SIZE; ++i) {
         io_probe[i] = 0U;
     }
-    unsigned int disk_sectors = disk_sector_count();
-    int bad_lba_read = disk_read_sectors(disk_sectors, 1U, io_probe);
-    int bad_lba_write = disk_write_sectors(disk_sectors, 1U, io_probe);
-    int zero_count_read = disk_read_sectors(0U, 0U, io_probe);
+    unsigned int disk_sectors = block_sector_count();
+    int bad_lba_read = block_read_sectors(disk_sectors, 1U, io_probe);
+    int bad_lba_write = block_write_sectors(disk_sectors, 1U, io_probe);
+    int zero_count_read = block_read_sectors(0U, 0U, io_probe);
 
     for (unsigned int i = 0U; i < FILESYSTEM_FAT_ENTRIES; ++i) {
         filesystem_fat[i] = filesystem_fat_backup[i];
@@ -3502,7 +3385,39 @@ static struct idt_entry idt[256];
 
 /* These helpers are defined below initialize_idt(). */
 static void set_irq_gates(unsigned short selector);
-static void initialize_timer(void);
+
+/* Save the interrupted task's IRQ frame and select the next ready task.
+   This bounded state switch does not scan deadlines or perform cleanup. */
+static unsigned int schedule_from_timer(unsigned int saved_stack_pointer)
+{
+    unsigned int previous_id = current_task_id;
+    unsigned int next_id = previous_id;
+
+    tasks[previous_id].interrupt_esp = saved_stack_pointer;
+    if (tasks[previous_id].state == TASK_RUNNING) {
+        tasks[previous_id].state = TASK_READY;
+    }
+
+    for (unsigned int offset = 1U; offset <= MAX_TASKS; ++offset) {
+        unsigned int candidate = (previous_id + offset) % MAX_TASKS;
+        if (tasks[candidate].state == TASK_READY) {
+            next_id = candidate;
+            break;
+        }
+    }
+
+    if (next_id == previous_id) {
+        if (tasks[previous_id].state == TASK_READY) {
+            tasks[previous_id].state = TASK_RUNNING;
+        }
+        return saved_stack_pointer;
+    }
+
+    tasks[next_id].state = TASK_RUNNING;
+    current_task_id = next_id;
+    ++timer_preemption_count;
+    return tasks[next_id].interrupt_esp;
+}
 
 static void set_idt_gate(unsigned int vector, unsigned int handler,
                          unsigned short selector)
@@ -3541,8 +3456,8 @@ static void initialize_idt(void)
     /* Set up IRQ gates for hardware interrupts 32-47 */
     set_irq_gates(code_selector);
 
-    /* Initialize the PIT timer */
-    initialize_timer();
+    pic_initialize();
+    timer_initialize();
 }
 
 /* Set up IRQ gates for hardware interrupts 32-47 */
@@ -3573,156 +3488,31 @@ static void set_irq_gates(unsigned short selector)
     idt_load(&pointer);
 }
 
-/* Initialize the PIT timer. */
-/* PIT channel 0: mode 3 (square wave) */
-/* Using divisor 11932 gives ~100 Hz (10ms tick) */
-static void initialize_timer(void)
-{
-    /* Remap PICs so IRQ0-7 map to vectors 32-39 and IRQ8-15 map to 40-47 */
-    outb(0x20, 0x11); /* Master PIC: ICW1 (ICW4 needed) */
-    outb(0xA0, 0x11); /* Slave PIC: ICW1 */
-    outb(0x21, 0x20); /* Master PIC: ICW2 (base = 0x20 = vector 32) */
-    outb(0xA1, 0x28); /* Slave PIC: ICW2 (base = 0x28 = vector 40) */
-    outb(0x21, 0x04); /* Master PIC: ICW3 (slave on IRQ2) */
-    outb(0xA1, 0x02); /* Slave PIC: ICW3 (cascade at IRQ2) */
-    outb(0x21, 0x01); /* Master PIC: ICW4 (8086 mode) */
-    outb(0xA1, 0x01); /* Slave PIC: ICW4 (8086 mode) */
-
-    /* Unmask IRQ0 (timer) and IRQ1 (keyboard) on the master PIC */
-    outb(0x21, 0xFC); /* 1111 1100 = unmask IRQ0 and IRQ1, mask the rest */
-    outb(0xA1, 0xFF); /* Mask all slave IRQs */
-
-    /* PIT divisor = 1193180 / 100 = ~11932 */
-    unsigned int divisor = 11932U;
-
-    /* Command port: 0x36 = channel 0, mode 3, binary, LSB then MSB */
-    outb(0x43, 0x36);
-
-    /* Send divisor (LSB then MSB) */
-    outb(0x40, (unsigned char)(divisor & 0xFF));
-    outb(0x40, (unsigned char)((divisor >> 8) & 0xFF));
-
-    timer_ticks = 0;
-    timer_uptime_seconds = 0;
-    timer_ticks_in_second = 0U;
-    task_wakeup_pending = 0;
-}
-
-/* The IRQ1 (keyboard) handler. Reads the scan code, translates it, and
-   pushes the character onto the keyboard ring buffer. Does NOT touch the
-   screen — the shell drains the buffer and echoes. */
-static void keyboard_irq_handler(void)
-{
-    unsigned char code = inb(0x60);
-
-    /* Track both Shift keys independently so either can remain held. */
-    if (code == 0x2AU) {
-        keyboard_left_shift_down = 1;
-        return;
-    }
-    if (code == 0x36U) {
-        keyboard_right_shift_down = 1;
-        return;
-    }
-    if (code == 0xAAU) {
-        keyboard_left_shift_down = 0;
-        return;
-    }
-    if (code == 0xB6U) {
-        keyboard_right_shift_down = 0;
-        return;
-    }
-    if (code == 0x3AU) {
-        keyboard_caps_lock = !keyboard_caps_lock;
-        return;
-    }
-
-    /* Ignore other key releases (the high bit is set). */
-    if ((code & 0x80U) != 0U) {
-        return;
-    }
-
-    int shifted = keyboard_left_shift_down || keyboard_right_shift_down;
-    char character = key_from_scancode(code, shifted, keyboard_caps_lock);
-    if (character == '\0') {
-        return; /* Unsupported key. */
-    }
-
-    /* Buffer full: drop the character rather than corrupting the buffer. */
-    if (keyboard_count >= KEYBOARD_BUFFER_SIZE) {
-        return;
-    }
-
-    keyboard_buffer[keyboard_head] = character;
-    keyboard_head = (keyboard_head + 1U) % KEYBOARD_BUFFER_SIZE;
-    ++keyboard_count;
-}
-
-/* Save this IRQ frame and select a READY task. Returning a different frame
-   makes irq_common resume that task through popa/iret. */
-static unsigned int schedule_from_timer(unsigned int saved_stack_pointer)
-{
-    unsigned int previous_id = current_task_id;
-    tasks[previous_id].interrupt_esp = saved_stack_pointer;
-    if (tasks[previous_id].state == TASK_RUNNING) {
-        tasks[previous_id].state = TASK_READY;
-    }
-
-    unsigned int next_id = previous_id;
-    for (unsigned int offset = 1U; offset <= MAX_TASKS; ++offset) {
-        unsigned int candidate = (previous_id + offset) % MAX_TASKS;
-        if (tasks[candidate].state == TASK_READY) {
-            next_id = candidate;
-            break;
-        }
-    }
-
-    tasks[next_id].state = TASK_RUNNING;
-    current_task_id = next_id;
-    if (next_id != previous_id) {
-        ++timer_preemption_count;
-    }
-    return tasks[next_id].interrupt_esp;
-}
-
-/* Central dispatch for hardware interrupts 32-47, called by irq_common in
-   interrupts.asm. Return the stack frame that irq_common should restore. */
 unsigned int irq_handler(unsigned int irq_vector,
                          unsigned int saved_stack_pointer)
 {
     unsigned int return_stack = saved_stack_pointer;
     switch (irq_vector) {
         case 32: /* IRQ0: PIT timer */
-            timer_ticks++;
+            timer_handle_interrupt();
             task_wakeup_pending = 1;
-            if (++timer_ticks_in_second >= 100U) {
-                timer_ticks_in_second = 0U;
-                timer_uptime_seconds++;
-            }
-            /* Send EOI to the master PIC (IRQ0 is a master-PIC line). */
-            outb(0x20, 0x20);
+            pic_send_eoi(irq_vector);
             if (timer_preemption_enabled && task_model_ready && task_count > 1U) {
                 return_stack = schedule_from_timer(saved_stack_pointer);
             }
             break;
 
         case 33: /* IRQ1: PS/2 keyboard */
-            keyboard_irq_handler();
-            /* Send EOI to the master PIC (IRQ1 is a master-PIC line). */
-            outb(0x20, 0x20);
+            keyboard_handle_interrupt();
+            pic_send_eoi(irq_vector);
             break;
 
         default:
-            /* Unhandled IRQ: still acknowledge so the PIC isn't wedged. */
-            if (irq_vector >= 40U) {
-                outb(0xA0, 0x20); /* EOI to slave PIC */
-            }
-            outb(0x20, 0x20);     /* EOI to master PIC */
+            pic_send_eoi(irq_vector);
             break;
     }
     return return_stack;
 }
-
 static void report_page_fault(unsigned int error_code, unsigned int address)
 {
     put_string("Page fault address: 0x");
@@ -4274,15 +4064,15 @@ static void run_heap_demo(void)
 
 static void show_disk_info(void)
 {
-    int result = disk_initialize();
+    int result = block_initialize();
     if (result != 0) {
         put_string("Disk unavailable: ");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
 
-    unsigned int sectors = disk_sector_count();
+    unsigned int sectors = block_sector_count();
     put_string("Primary IDE disk: ready\nSectors: ");
     put_unsigned(sectors);
     put_string("\nCapacity: ");
@@ -4328,7 +4118,7 @@ static void run_disk_test(void)
 {
     unsigned char write_buffer[DISK_SECTOR_SIZE];
     unsigned char read_buffer[DISK_SECTOR_SIZE];
-    unsigned int sectors = disk_sector_count();
+    unsigned int sectors = block_sector_count();
 
     if (sectors <= DISK_TEST_SECTOR) {
         put_string("Disk test unavailable: disk is missing or too small.\n");
@@ -4340,18 +4130,18 @@ static void run_disk_test(void)
         read_buffer[i] = 0U;
     }
 
-    int result = disk_write_sectors(DISK_TEST_SECTOR, 1U, write_buffer);
+    int result = block_write_sectors(DISK_TEST_SECTOR, 1U, write_buffer);
     if (result < 0) {
         put_string("Disk write failed: ");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
 
-    result = disk_read_sectors(DISK_TEST_SECTOR, 1U, read_buffer);
+    result = block_read_sectors(DISK_TEST_SECTOR, 1U, read_buffer);
     if (result < 0) {
         put_string("Disk read failed: ");
-        put_string(disk_error_string(result));
+        put_string(block_error_string(result));
         put_char('\n');
         return;
     }
@@ -4894,7 +4684,7 @@ static void run_command(void)
         run_preempt_demo();
     } else if (command_is("uptime")) {
         put_string("Uptime: ");
-        put_unsigned(timer_uptime_seconds);
+        put_unsigned(timer_uptime_seconds());
         put_string(" seconds\n");
     } else if (command_is("about")) {
         put_string("TinyOS is a small educational operating system.\n");
@@ -5526,17 +5316,7 @@ static void run_command(void)
 
 /* Returns the next buffered keyboard character, or '\0' if the buffer is
    empty. Called by the shell loop (with interrupts enabled). */
-static char keyboard_read(void)
-{
-    if (keyboard_count == 0U) {
-        return '\0';
-    }
 
-    char character = keyboard_buffer[keyboard_tail];
-    keyboard_tail = (keyboard_tail + 1U) % KEYBOARD_BUFFER_SIZE;
-    --keyboard_count;
-    return character;
-}
 
 void kernel_main(unsigned int boot_magic, unsigned int info_address)
 {
@@ -5591,6 +5371,7 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
 
     initialize_page_allocator();
     gdt_initialize();
+    keyboard_initialize();
     /* Install the IDT first so a page fault during paging setup is
        reported cleanly instead of triple-faulting. */
     initialize_idt();
@@ -5598,7 +5379,7 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
     initialize_task_model();
     (void)heap_initialize();
     int file_store_result = initialize_file_store();
-    clear_screen();
+    display_initialize();
     put_string("TinyOS shell. Type help for commands.\n");
     if (file_store_result == 0) {
         put_string("Persistent file store ready.\n");
@@ -5609,16 +5390,16 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
     }
     show_prompt();
 
-    /* Enable interrupts so the timer can fire */
+    /* Enable interrupts so the timer and keyboard drivers can run. */
     __asm__ volatile ("sti");
 
     for (;;) {
         /* Block until the keyboard IRQ1 handler has buffered a character. */
-        while (keyboard_count == 0U) {
+        while (!keyboard_has_input()) {
             __asm__ volatile ("hlt");
         }
 
-        char character = keyboard_read();
+        char character = keyboard_read_char();
 
         if (character == '\n') {
             put_char('\n');
@@ -5642,3 +5423,4 @@ void kernel_main(unsigned int boot_magic, unsigned int info_address)
         }
     }
 }
+
